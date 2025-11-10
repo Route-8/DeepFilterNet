@@ -5,6 +5,16 @@ use wasm_bindgen::prelude::*;
 
 use crate::tract::*;
 
+#[cfg(feature = "wasm")]
+use console_error_panic_hook;
+
+// Initialize panic hook for better error reporting in browser console
+#[wasm_bindgen(start)]
+pub fn init_panic_hook() {
+    #[cfg(feature = "wasm")]
+    console_error_panic_hook::set_once();
+}
+
 #[wasm_bindgen]
 pub struct DFState(crate::tract::DfTract);
 
@@ -12,9 +22,12 @@ pub struct DFState(crate::tract::DfTract);
 impl DFState {
     fn new(model_bytes: &[u8], channels: usize, atten_lim: f32) -> Self {
         let r_params = RuntimeParams::default_with_ch(channels).with_atten_lim(atten_lim);
-        let df_params = DfParams::from_bytes(model_bytes).expect("Could not load model from path");
+
+        // This will panic with detailed error message (caught by panic hook)
+        let df_params = DfParams::from_bytes(model_bytes).expect("Could not load model from bytes");
         let m =
-            DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime.");
+            DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime");
+
         DFState(m)
     }
     fn boxed(self) -> Box<DFState> {
