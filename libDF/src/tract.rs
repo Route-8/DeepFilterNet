@@ -528,8 +528,16 @@ impl DfTract {
         }
 
         // Signal model: y = f(s + n) = f(x)
-        self.rolling_spec_buf_y.pop_front();
-        self.rolling_spec_buf_x.pop_front();
+        // Recycle popped tensors to avoid per-frame heap allocation.
+        let mut recycled_y = self
+            .rolling_spec_buf_y
+            .pop_front()
+            .expect("rolling_spec_buf_y should never be empty during process()");
+        let mut recycled_x = self
+            .rolling_spec_buf_x
+            .pop_front()
+            .expect("rolling_spec_buf_x should never be empty during process()");
+
         for (ns_ch, mut rbuf, state) in izip!(
             noisy.axis_iter(Axis(0)),
             self.spec_buf.to_array_view_mut()?.axis_iter_mut(Axis(0)),
@@ -538,8 +546,16 @@ impl DfTract {
             let spec = as_slice_mut_complex(rbuf.as_slice_mut().unwrap());
             state.analysis(ns_ch.as_slice().unwrap(), spec);
         }
-        self.rolling_spec_buf_y.push_back(self.spec_buf.clone());
-        self.rolling_spec_buf_x.push_back(self.spec_buf.clone());
+
+        // Copy spec_buf data into recycled tensors (no heap allocation)
+        {
+            let src = self.spec_buf.as_slice::<f32>()?;
+            recycled_y.as_slice_mut::<f32>()?.copy_from_slice(src);
+            recycled_x.as_slice_mut::<f32>()?.copy_from_slice(src);
+        }
+
+        self.rolling_spec_buf_y.push_back(recycled_y);
+        self.rolling_spec_buf_x.push_back(recycled_x);
         if self.atten_lim.unwrap_or_default() == 1. {
             enh.assign(&noisy);
             return Ok(35.);
