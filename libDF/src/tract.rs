@@ -222,7 +222,7 @@ pub struct DfTract {
     pub df_states: Vec<DFState>,
     pub spec_buf: Tensor, // Real-valued spectrogram buffer of shape [n_ch, 1, 1, n_freqs, 2]
     erb_buf: TValue,      // Real-valued ERB feature buffer of shape [n_ch, 1, 1, n_erb]
-    cplx_buf: TValue,     // Real-valued complex epectrum shape for DF of shape [n_ch, 1, nb_df, 2]
+    cplx_buf: TValue,     // Real-valued complex spectrum for DF in split layout [n_ch, 2, 1, nb_df]
     m_zeros: Vec<f32>,    // Preallocated buffer for applying a zero mask
     rolling_spec_buf_y: VecDeque<Tensor>, // Enhanced stage 1 spec buf
     rolling_spec_buf_x: VecDeque<Tensor>, // Noisy spec buf
@@ -302,7 +302,7 @@ impl DfTract {
             Tensor::uninitialized_dt(f32::datum_type(), &[1, 1, 1, nb_erb])?
         });
         let cplx_buf = TValue::from(unsafe {
-            Tensor::uninitialized_dt(f32::datum_type(), &[1, 1, nb_df, 2])?
+            Tensor::uninitialized_dt(f32::datum_type(), &[1, 2, 1, nb_df])?
         });
         let m_zeros = vec![0.; nb_erb];
 
@@ -426,7 +426,7 @@ impl DfTract {
         }
         self.spec_buf = Tensor::zero::<f32>(&spec_shape)?;
         self.erb_buf = TValue::from(Tensor::zero::<f32>(&[ch, 1, 1, self.nb_erb])?);
-        self.cplx_buf = TValue::from(Tensor::zero::<f32>(&[ch, 1, self.nb_df, 2])?);
+        self.cplx_buf = TValue::from(Tensor::zero::<f32>(&[ch, 2, 1, self.nb_df])?);
         self.synthesis_tmp.resize(self.n_freqs, Complex32::default());
 
         Ok(())
@@ -453,16 +453,16 @@ impl DfTract {
         ) {
             let nsy_ch = as_slice_complex(nsy_ch.as_slice().unwrap());
             state.feat_erb(nsy_ch, self.alpha, erb_ch.as_slice_mut().unwrap());
-            state.feat_cplx(
+            state.feat_cplx_t(
                 &nsy_ch[..self.nb_df],
                 self.alpha,
-                as_slice_mut_complex(cplx_ch.as_slice_mut().unwrap()),
+                cplx_ch.as_slice_mut().unwrap(),
             );
         }
         // Run encoder
         let mut enc_emb = self.enc.run(tvec!(
             self.erb_buf.clone(),
-            TValue::from(self.cplx_buf.clone().into_tensor().permute_axes(&[0, 3, 1, 2])?)
+            self.cplx_buf.clone()
         ))?;
 
         let &lsnr = enc_emb.pop().unwrap().to_scalar::<f32>()?;

@@ -279,8 +279,8 @@ pub fn band_unit_norm_t(xs: &[Complex32], state: &mut [f32], alpha: f32, out: &m
         o_im.iter_mut(),
     ) {
         *s = x.norm() * (1. - alpha) + *s * alpha;
-        *o_re /= s.sqrt();
-        *o_im /= s.sqrt();
+        *o_re = x.re / s.sqrt();
+        *o_im = x.im / s.sqrt();
     }
 }
 
@@ -655,6 +655,62 @@ mod tests {
                 assert_eq!(input[i] * mask[erb_idx], output[i])
             }
             cumsum += erb_w;
+        }
+    }
+
+    #[test]
+    fn test_band_unit_norm_t_matches_band_unit_norm() {
+        let nb_df = 8;
+        let alpha = 0.8_f32;
+
+        let input: Vec<Complex32> = (0..nb_df)
+            .map(|i| Complex32::new(0.5 + i as f32 * 0.1, -0.3 + i as f32 * 0.05))
+            .collect();
+
+        // Initialize states identically
+        let mut state_interleaved: Vec<f32> = (0..nb_df)
+            .map(|i| {
+                UNIT_NORM_INIT[0]
+                    + i as f32 * (UNIT_NORM_INIT[1] - UNIT_NORM_INIT[0]) / (nb_df - 1) as f32
+            })
+            .collect();
+        let mut state_transposed = state_interleaved.clone();
+
+        // Run band_unit_norm (interleaved, in-place)
+        let mut output_interleaved = input.clone();
+        band_unit_norm(&mut output_interleaved, &mut state_interleaved, alpha);
+
+        // Run band_unit_norm_t (transposed, out-of-place)
+        let mut output_transposed = vec![0.0_f32; nb_df * 2];
+        band_unit_norm_t(&input, &mut state_transposed, alpha, &mut output_transposed);
+
+        // Verify states are identical
+        for (s1, s2) in state_interleaved.iter().zip(state_transposed.iter()) {
+            assert!((s1 - s2).abs() < 1e-7, "State diverged: {} vs {}", s1, s2);
+        }
+
+        // Verify output values match (different layout, same values)
+        let (re_part, im_part) = output_transposed.split_at(nb_df);
+        for (i, c) in output_interleaved.iter().enumerate() {
+            assert!((c.re - re_part[i]).abs() < 1e-7, "Real mismatch at {}", i);
+            assert!((c.im - im_part[i]).abs() < 1e-7, "Imag mismatch at {}", i);
+        }
+
+        // Run a second frame to verify state continuity
+        let input2: Vec<Complex32> = (0..nb_df)
+            .map(|i| Complex32::new(0.2 + i as f32 * 0.15, 0.1 - i as f32 * 0.02))
+            .collect();
+
+        let mut output_interleaved2 = input2.clone();
+        band_unit_norm(&mut output_interleaved2, &mut state_interleaved, alpha);
+
+        let mut output_transposed2 = vec![0.0_f32; nb_df * 2];
+        band_unit_norm_t(&input2, &mut state_transposed, alpha, &mut output_transposed2);
+
+        let (re_part2, im_part2) = output_transposed2.split_at(nb_df);
+        for (i, c) in output_interleaved2.iter().enumerate() {
+            assert!((c.re - re_part2[i]).abs() < 1e-7, "Frame 2 real mismatch at {}", i);
+            assert!((c.im - im_part2[i]).abs() < 1e-7, "Frame 2 imag mismatch at {}", i);
         }
     }
 }
