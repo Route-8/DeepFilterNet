@@ -62,6 +62,8 @@ pub struct DFState {
     analysis_scratch: Vec<Complex32>,
     synthesis_mem: Vec<f32>,
     synthesis_scratch: Vec<Complex32>,
+    fft_input_buf: Vec<f32>,
+    fft_output_buf: Vec<f32>,
     mean_norm_state: Vec<f32>,
     unit_norm_state: Vec<f32>,
 }
@@ -121,6 +123,8 @@ impl DFState {
         let synthesis_mem = vec![0.; fft_size - frame_size];
         let analysis_scratch = forward.make_scratch_vec();
         let synthesis_scratch = backward.make_scratch_vec();
+        let fft_input_buf = forward.make_input_vec();
+        let fft_output_buf = backward.make_output_vec();
 
         let erb = erb_fb(sr, fft_size, nb_bands, min_nb_freqs);
 
@@ -147,6 +151,8 @@ impl DFState {
             analysis_scratch,
             synthesis_mem,
             synthesis_scratch,
+            fft_input_buf,
+            fft_output_buf,
             window,
             wnorm,
             mean_norm_state,
@@ -358,7 +364,7 @@ fn frame_analysis(input: &[f32], output: &mut [Complex32], state: &mut DFState) 
     debug_assert_eq!(input.len(), state.frame_size);
     debug_assert_eq!(output.len(), state.freq_size);
 
-    let mut buf = state.fft_forward.make_input_vec();
+    let buf = &mut state.fft_input_buf;
     // First part of the window on the previous frame
     let (buf_first, buf_second) = buf.split_at_mut(state.window_size - state.frame_size);
     let (window_first, window_second) = state.window.split_at(state.window_size - state.frame_size);
@@ -385,7 +391,7 @@ fn frame_analysis(input: &[f32], output: &mut [Complex32], state: &mut DFState) 
     }
     state
         .fft_forward
-        .process_with_scratch(&mut buf, output, &mut state.analysis_scratch)
+        .process_with_scratch(buf, output, &mut state.analysis_scratch)
         .expect("FFT forward failed");
     // Apply normalization in analysis only
     let norm = state.wnorm;
@@ -395,16 +401,16 @@ fn frame_analysis(input: &[f32], output: &mut [Complex32], state: &mut DFState) 
 }
 
 fn frame_synthesis(input: &mut [Complex32], output: &mut [f32], state: &mut DFState) {
-    let mut x = state.fft_inverse.make_output_vec();
+    let x = &mut state.fft_output_buf;
     match state
         .fft_inverse
-        .process_with_scratch(input, &mut x, &mut state.synthesis_scratch)
+        .process_with_scratch(input, x, &mut state.synthesis_scratch)
     {
         Err(realfft::FftError::InputValues(_, _)) => (),
         Err(e) => panic!("Error during fft_inverse: {:?}", e),
         Ok(_) => (),
     }
-    apply_window_in_place(&mut x, &state.window);
+    apply_window_in_place(x, &state.window);
     let (x_first, x_second) = x.split_at(state.frame_size);
     for ((&xi, &mem), out) in x_first.iter().zip(state.synthesis_mem.iter()).zip(output.iter_mut())
     {
