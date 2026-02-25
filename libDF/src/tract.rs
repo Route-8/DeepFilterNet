@@ -227,6 +227,7 @@ pub struct DfTract {
     rolling_spec_buf_y: VecDeque<Tensor>, // Enhanced stage 1 spec buf
     rolling_spec_buf_x: VecDeque<Tensor>, // Noisy spec buf
     skip_counter: usize,  // Increment when wanting to skip processing due to low RMS
+    synthesis_tmp: Vec<Complex32>, // Pre-allocated buffer for synthesis input (len = n_freqs)
 }
 
 #[cfg(all(not(feature = "capi"), feature = "default-model"))]
@@ -358,6 +359,7 @@ impl DfTract {
             post_filter: rp.post_filter,
             post_filter_beta: rp.post_filter_beta,
             skip_counter: 0,
+            synthesis_tmp: vec![Complex32::default(); n_freqs],
         };
         m.init()?;
         #[cfg(feature = "timings")]
@@ -425,6 +427,7 @@ impl DfTract {
         self.spec_buf = Tensor::zero::<f32>(&spec_shape)?;
         self.erb_buf = TValue::from(Tensor::zero::<f32>(&[ch, 1, 1, self.nb_erb])?);
         self.cplx_buf = TValue::from(Tensor::zero::<f32>(&[ch, 1, self.nb_df, 2])?);
+        self.synthesis_tmp.resize(self.n_freqs, Complex32::default());
 
         Ok(())
     }
@@ -644,14 +647,12 @@ impl DfTract {
             spec_enh.scaled_add(lim.into(), &spec_noisy);
         }
 
-        for (state, spec_ch, mut enh_out_ch) in izip!(
-            self.df_states.iter_mut(),
-            spec_enh.axis_iter(Axis(0)),
-            enh.axis_iter_mut(Axis(0)),
-        ) {
-            state.synthesis(
-                spec_ch.to_owned().as_slice_mut().unwrap(),
-                enh_out_ch.as_slice_mut().unwrap(),
+        for ch_idx in 0..self.ch {
+            let spec_ch = spec_enh.index_axis(Axis(0), ch_idx);
+            self.synthesis_tmp.copy_from_slice(spec_ch.as_slice().unwrap());
+            self.df_states[ch_idx].synthesis(
+                &mut self.synthesis_tmp,
+                enh.index_axis_mut(Axis(0), ch_idx).as_slice_mut().unwrap(),
             );
         }
         Ok(lsnr)
