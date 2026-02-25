@@ -23,14 +23,20 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
-          target: ${{ matrix.target }}
+          target: wasm32-unknown-unknown
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm-cargo-${{ hashFiles('**/Cargo.toml') }}
+          cache-on-failure: true
 
       # https://rustwasm.github.io/wasm-pack/installer/
       - name: Install wasm-pack
         run: cargo install wasm-pack
 
       - name: Build wasm package
-        run: wasm-pack build libDF --target no-modules --features wasm
+        run: RUSTFLAGS="-C target-feature=+simd128,+bulk-memory" wasm-pack build libDF --target no-modules --features wasm -- --profile release-lto
 
       - uses: actions/upload-artifact@v4
         with:
