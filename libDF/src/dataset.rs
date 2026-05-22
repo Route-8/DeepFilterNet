@@ -25,7 +25,7 @@ use claxon;
 use hdf5::{types::VarLenUnicode, File};
 use ndarray::concatenate;
 use ndarray::{prelude::*, Slice};
-use ndarray_rand::rand::prelude::{IteratorRandom, SliceRandom};
+use rand::prelude::{IndexedRandom, IteratorRandom, SliceRandom};
 use rayon::prelude::*;
 use realfft::num_traits::Zero;
 use serde::{Deserialize, Serialize};
@@ -1462,8 +1462,9 @@ impl fmt::Display for DsType {
         write!(f, "{self:?}")
     }
 }
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub enum Codec {
+    #[default]
     PCM = 0,
     Vorbis = 1,
     FLAC = 2,
@@ -1471,11 +1472,6 @@ pub enum Codec {
 impl Default for &Codec {
     fn default() -> Self {
         &Codec::PCM
-    }
-}
-impl Default for Codec {
-    fn default() -> Self {
-        Codec::PCM
     }
 }
 #[derive(Debug)]
@@ -1704,7 +1700,7 @@ impl Hdf5Dataset {
             1 => {
                 // Return in channels first
                 let len = x.len_of(Axis(0));
-                x.into_shape((1, len))?
+                x.into_shape_with_order((1, len))?
             }
             2 => match ch_idx {
                 Some(-1) => {
@@ -1736,8 +1732,12 @@ impl Hdf5Dataset {
         r: Option<Range<usize>>,
     ) -> Result<Array2<f32>> {
         let ds = self.ds(key)?;
-        let arr = if let Some(r) = r {
-            // Directly to a sliced dataset read
+        let mut arr = {
+            let arr = ds.read_dyn::<f32>()?;
+            let shape = arr.shape().to_vec();
+            ArrayD::from_shape_vec(IxDyn(&shape), arr.iter().copied().collect())?
+        };
+        if let Some(r) = r {
             if r.end > *ds.shape().last().unwrap_or(&0) {
                 return Err(DfDatasetError::PcmRangeToLarge {
                     range: r,
@@ -1745,20 +1745,11 @@ impl Hdf5Dataset {
                 });
             }
             match ds.ndim() {
-                1 => ds.read_slice(s![r])?,
-                2 => match channel {
-                    Some(-1) => {
-                        let nch = ds.shape()[1];
-                        ds.read_slice(s![thread_rng()?.uniform(0, nch), r])
-                    } // rand ch
-                    Some(channel) => ds.read_slice(s![channel, r]), // specified channel
-                    None => ds.read_slice(s![.., r]),               // all channels
-                }?,
+                1 => arr.slice_axis_inplace(Axis(0), Slice::from(r)),
+                2 => arr.slice_axis_inplace(Axis(1), Slice::from(r)),
                 n => return Err(DfDatasetError::PcmUnspportedDimension(n)),
             }
-        } else {
-            ds.read_dyn::<f32>()?
-        };
+        }
         let mut arr = self.match_ch(arr, 0, channel)?;
         match self.dtype {
             Some(DType::I16) => arr /= i16::MAX as f32,
@@ -2002,7 +1993,8 @@ fn combine_noises(
     // Adjust number of noise channels to clean channels
     for ns in noises.iter_mut() {
         while ns.len_of(Axis(0)) > ch {
-            ns.remove_index(Axis(0), rng.uniform(0, ns.len_of(Axis(0))))
+            let idx = rng.uniform(0, ns.len_of(Axis(0)));
+            ns.remove_index(Axis(0), idx)
         }
         while ns.len_of(Axis(0)) < ch {
             let r = rng.uniform(0, ns.len_of(Axis(0)));
@@ -2028,16 +2020,16 @@ fn combine_noises(
 ///
 /// * `clean` - A clean speech signal of shape `[C, N]`.
 /// * `clean_distorted` - An optional distorted speech signal of shape `[C, N]`. If provided, this signal
-///                  will be used for creating the noisy mixture. `clean` may be used as a training
-///                  target and usually contains no or less distortions. This can be used to learn
-///                  some dereverberation or declipping.
+///   will be used for creating the noisy mixture. `clean` may be used as a training
+///   target and usually contains no or less distortions. This can be used to learn
+///   some dereverberation or declipping.
 /// * `noise` - A noise signal of shape `[C, N]`. Will be modified in place.
 /// * `snr_db` - Signal to noise ratio in decibel used for mixing.
 /// * `gain_db` - Gain to apply to the clean signal in decibel before mixing.
 /// * `noise_resample`: Optional resample parameters which will be used to apply a low-pass via
-///                     resampling to the noise signal. This may be used to make sure a speech
-///                     signal with a lower sampling rate will also be mixed with noise having the
-///                     same sampling rate.
+///   resampling to the noise signal. This may be used to make sure a speech
+///   signal with a lower sampling rate will also be mixed with noise having the
+///   same sampling rate.
 ///
 /// Returns
 ///
@@ -2321,8 +2313,8 @@ mod tests {
         seed_from_u64(0);
         let sr = 48_000;
         let n = sr;
-        let clean = arr1(rng_uniform(n, -0.1, 0.1)?.as_slice()).into_shape([1, n])?;
-        let noise = arr1(rng_uniform(n, -0.1, 0.1)?.as_slice()).into_shape([1, n])?;
+        let clean = arr1(rng_uniform(n, -0.1, 0.1)?.as_slice()).into_shape_with_order([1, n])?;
+        let noise = arr1(rng_uniform(n, -0.1, 0.1)?.as_slice()).into_shape_with_order([1, n])?;
         let gains = [-6., 0., 6.];
         let snrs = [-10., -5., 0., 5., 10., 20., 40.];
         let atol = 1e-4;

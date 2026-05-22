@@ -31,6 +31,25 @@ impl DfParams {
         let file = File::open(tar_file).context("Could not open model tar file.")?;
         Self::from_targz(file)
     }
+    pub fn runtime_info(&self) -> Result<(usize, usize, usize)> {
+        let df_cfg = self
+            .config
+            .section(Some("df"))
+            .context("Could not find df section in model config")?;
+        let sr = df_cfg
+            .get("sr")
+            .context("Could not find sr in model config")?
+            .parse::<usize>()?;
+        let hop_size = df_cfg
+            .get("hop_size")
+            .context("Could not find hop_size in model config")?
+            .parse::<usize>()?;
+        let fft_size = df_cfg
+            .get("fft_size")
+            .context("Could not find fft_size in model config")?
+            .parse::<usize>()?;
+        Ok((sr, hop_size, fft_size / 2 + 1))
+    }
     pub fn from_bytes(tar_buf: &[u8]) -> Result<Self> {
         Self::from_targz(tar_buf)
     }
@@ -91,16 +110,12 @@ impl Default for DfParams {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum ReduceMask {
+    #[default]
     NONE = 0,
     MAX = 1,
     MEAN = 2,
-}
-impl Default for ReduceMask {
-    fn default() -> Self {
-        ReduceMask::NONE
-    }
 }
 impl TryFrom<i32> for ReduceMask {
     type Error = ();

@@ -620,8 +620,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use rand::distributions::{Distribution, Uniform};
-
     use super::*;
 
     #[test]
@@ -632,11 +630,12 @@ mod tests {
         let hop = n_fft / 2;
         let nb_bands = 24;
         let state = DFState::new(sr, n_fft, hop, nb_bands, 1);
-        let d = Uniform::new(-1., 1.);
         let mut input = Vec::with_capacity(n_freqs);
-        let mut rng = rand::thread_rng();
         for _ in 0..(n_freqs) {
-            input.push(Complex32::new(d.sample(&mut rng), d.sample(&mut rng)))
+            input.push(Complex32::new(
+                rand::random_range(-1.0..1.0),
+                rand::random_range(-1.0..1.0),
+            ))
         }
         let mut mask = vec![1.; nb_bands];
         mask[3] = 0.3;

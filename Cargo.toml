@@ -9,6 +9,9 @@ members = [
   "demo",
 ]
 
+[patch.crates-io]
+bitflags = { path = "vendor/bitflags-0.8.2" }
+
 [profile.dev]
 opt-level = 1
 incremental = false
