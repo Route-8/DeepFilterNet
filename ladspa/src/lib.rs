@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::sync::{
     mpsc::{sync_channel, Receiver, SyncSender},
-    Arc, Mutex, Once,
+    Arc, Mutex, Once, OnceLock,
 };
 use std::thread::{self, sleep, JoinHandle};
 use std::time::{Duration, Instant};
@@ -66,7 +66,7 @@ struct DfPlugin {
 
 const ID_MONO: u64 = 7843795;
 const ID_STEREO: u64 = 7843796;
-static mut MODEL: Option<DfTract> = None;
+static DF_PARAMS: OnceLock<DfParams> = OnceLock::new();
 
 fn log_format(buf: &mut env_logger::fmt::Formatter, record: &log::Record) -> io::Result<()> {
     let ts = buf.timestamp_millis();
@@ -75,13 +75,11 @@ fn log_format(buf: &mut env_logger::fmt::Formatter, record: &log::Record) -> io:
     } else {
         "".to_string()
     };
-    let level_style = buf.default_level_style(log::Level::Info);
-
     writeln!(
         buf,
         "{} | {} | {} {}",
         ts,
-        level_style.value(record.level()),
+        record.level(),
         module,
         record.args()
     )
@@ -106,12 +104,16 @@ fn syslog_format(buf: &mut env_logger::fmt::Formatter, record: &log::Record) -> 
 fn get_worker_fn(
     inqueue: SampleQueue,
     outqueue: SampleQueue,
+    df_params: DfParams,
+    channels: usize,
     controls: ControlRecv,
     sleep_duration: Duration,
     id: String,
-) -> impl FnMut() {
+) -> impl FnOnce() {
     move || {
-        let mut df = unsafe { MODEL.clone().unwrap() };
+        let r_params = RuntimeParams::default_with_ch(channels);
+        let mut df =
+            DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime");
         let mut inframe = Array2::zeros((df.ch, df.hop_size));
         let mut outframe = Array2::zeros((df.ch, df.hop_size));
         let t_audio_ms = df.hop_size as f32 / df.sr as f32 * 1000.;
@@ -170,21 +172,11 @@ fn get_worker_fn(
 }
 
 /// Initialize DF model and returns sample rate and frame size
-fn init_df(channels: usize) -> (usize, usize) {
-    unsafe {
-        if let Some(m) = MODEL.as_ref() {
-            if m.ch == channels {
-                return (m.sr, m.hop_size);
-            }
-        }
-    }
-
-    let df_params = DfParams::default();
-    let r_params = RuntimeParams::default_with_ch(channels);
-    let df = DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime");
-    let (sr, frame_size) = (df.sr, df.hop_size);
-    unsafe { MODEL = Some(df) };
-    (sr, frame_size)
+fn init_df_params() -> (DfParams, usize, usize) {
+    let df_params = DF_PARAMS.get_or_init(DfParams::default).clone();
+    let (sr, frame_size, _) =
+        df_params.runtime_info().expect("Could not read DeepFilter model runtime info");
+    (df_params, sr, frame_size)
 }
 
 fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
@@ -206,7 +198,7 @@ fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
                 .init();
         });
 
-        let (m_sr, hop) = init_df(channels);
+        let (df_params, m_sr, hop) = init_df_params();
         assert_eq!(m_sr as u64, sample_rate, "Unsupported sample rate");
         let i_tx = Arc::new(Mutex::new(vec![VecDeque::with_capacity(hop * 4); channels]));
         let o_rx = Arc::new(Mutex::new(vec![VecDeque::with_capacity(hop * 4); channels]));
@@ -226,6 +218,8 @@ fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
         let worker_handle = thread::spawn(get_worker_fn(
             Arc::clone(&i_tx),
             Arc::clone(&o_rx),
+            df_params,
+            channels,
             control_rx,
             sleep_duration,
             id.clone(),

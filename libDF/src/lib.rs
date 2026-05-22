@@ -402,10 +402,7 @@ fn frame_analysis(input: &[f32], output: &mut [Complex32], state: &mut DFState) 
 
 fn frame_synthesis(input: &mut [Complex32], output: &mut [f32], state: &mut DFState) {
     let x = &mut state.fft_output_buf;
-    match state
-        .fft_inverse
-        .process_with_scratch(input, x, &mut state.synthesis_scratch)
-    {
+    match state.fft_inverse.process_with_scratch(input, x, &mut state.synthesis_scratch) {
         Err(realfft::FftError::InputValues(_, _)) => (),
         Err(e) => panic!("Error during fft_inverse: {:?}", e),
         Ok(_) => (),
@@ -626,8 +623,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use rand::distributions::{Distribution, Uniform};
-
     use super::*;
 
     #[test]
@@ -638,11 +633,12 @@ mod tests {
         let hop = n_fft / 2;
         let nb_bands = 24;
         let state = DFState::new(sr, n_fft, hop, nb_bands, 1);
-        let d = Uniform::new(-1., 1.);
         let mut input = Vec::with_capacity(n_freqs);
-        let mut rng = rand::thread_rng();
         for _ in 0..(n_freqs) {
-            input.push(Complex32::new(d.sample(&mut rng), d.sample(&mut rng)))
+            input.push(Complex32::new(
+                rand::random_range(-1.0..1.0),
+                rand::random_range(-1.0..1.0),
+            ))
         }
         let mut mask = vec![1.; nb_bands];
         mask[3] = 0.3;
@@ -705,12 +701,25 @@ mod tests {
         band_unit_norm(&mut output_interleaved2, &mut state_interleaved, alpha);
 
         let mut output_transposed2 = vec![0.0_f32; nb_df * 2];
-        band_unit_norm_t(&input2, &mut state_transposed, alpha, &mut output_transposed2);
+        band_unit_norm_t(
+            &input2,
+            &mut state_transposed,
+            alpha,
+            &mut output_transposed2,
+        );
 
         let (re_part2, im_part2) = output_transposed2.split_at(nb_df);
         for (i, c) in output_interleaved2.iter().enumerate() {
-            assert!((c.re - re_part2[i]).abs() < 1e-7, "Frame 2 real mismatch at {}", i);
-            assert!((c.im - im_part2[i]).abs() < 1e-7, "Frame 2 imag mismatch at {}", i);
+            assert!(
+                (c.re - re_part2[i]).abs() < 1e-7,
+                "Frame 2 real mismatch at {}",
+                i
+            );
+            assert!(
+                (c.im - im_part2[i]).abs() < 1e-7,
+                "Frame 2 imag mismatch at {}",
+                i
+            );
         }
     }
 }

@@ -4,8 +4,8 @@ use std::ops::Range;
 use std::time::Instant;
 
 use ndarray::{concatenate, prelude::*, Slice};
-use ndarray_rand::rand::{prelude::IteratorRandom, seq::SliceRandom, Rng};
-use ndarray_rand::{rand_distr::Normal, rand_distr::Uniform, RandomExt};
+use rand::{prelude::IteratorRandom, seq::IndexedRandom};
+use rand_distr::{Distribution, Normal, Uniform};
 use thiserror::Error;
 
 use self::BiquadFilter::*;
@@ -140,12 +140,12 @@ pub struct RandLFilt {
 }
 impl RandLFilt {
     pub fn new(p: f32, a: f32, b: f32) -> Self {
-        let uniform = Uniform::new_inclusive(a, b);
+        let uniform = Uniform::new_inclusive(a, b).unwrap();
         RandLFilt { prob: p, uniform }
     }
     fn sample_ab(&self) -> Result<[f32; 2]> {
         let mut rng = thread_rng()?;
-        Ok([rng.sample(self.uniform), rng.sample(self.uniform)])
+        Ok([self.uniform.sample(&mut rng), self.uniform.sample(&mut rng)])
     }
 }
 impl Transform for RandLFilt {
@@ -699,8 +699,10 @@ fn gen_noise_with_scratch(
     // Adopted from torch_audiomentations
     let sr = sr as usize;
     let ch = num_channels as usize;
+    let normal = Normal::new(0., 1.).unwrap();
+    let mut rng = rand::rng();
     let mut noise = if f_decay != 0. {
-        let mut noise = Array::random((ch, sr), Normal::new(0., 1.).unwrap());
+        let mut noise = Array2::from_shape_fn((ch, sr), |_| normal.sample(&mut rng));
         let spec = Array2::uninit([ch, sr / 2 + 1]);
         // Safety: Will be fully overwritten by fft transform.
         let mut spec = unsafe { spec.assume_init() };
@@ -715,7 +717,7 @@ fn gen_noise_with_scratch(
         noise
     } else {
         // Fast path for white noise
-        Array::random((ch, sr), Normal::new(0., 1.).unwrap())
+        Array2::from_shape_fn((ch, sr), |_| normal.sample(&mut rng))
     };
     let f = thread_rng()?.uniform(0.01, 0.95) / find_max_abs(&noise).unwrap().max(1.);
     noise *= f;
@@ -921,7 +923,7 @@ impl RandReverbSim {
     /// # Returns
     ///
     /// * `speech_rev` - An optional reverberant speech sample for mixing. This will contain a
-    ///                  more reverberation then the in place modified `speech` signal.
+    ///   more reverberation then the in place modified `speech` signal.
     pub fn transform<F>(
         &self,
         speech: &mut Array2<f32>,

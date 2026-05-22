@@ -2,4 +2,4 @@
 
 # look at DeepFilterNet/.github/workflows/build_wasm.yml for enviroment setup
 cd ./libDF/
-RUSTFLAGS="-C target-feature=+simd128,+bulk-memory" wasm-pack build --target no-modules --features wasm -- --profile release-lto
+RUSTFLAGS="-C target-feature=+simd128,+bulk-memory" wasm-pack build --no-opt --profile release-lto --target no-modules --features wasm

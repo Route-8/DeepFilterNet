@@ -36,7 +36,8 @@ jobs:
         run: cargo install wasm-pack
 
       - name: Build wasm package
-        run: RUSTFLAGS="-C target-feature=+simd128,+bulk-memory" wasm-pack build libDF --target no-modules --features wasm -- --profile release-lto
+        working-directory: libDF
+        run: RUSTFLAGS="-C target-feature=+simd128,+bulk-memory" wasm-pack build --no-opt --profile release-lto --target no-modules --features wasm
 
       - uses: actions/upload-artifact@v4
         with:

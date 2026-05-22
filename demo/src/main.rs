@@ -52,7 +52,7 @@ pub fn main() -> iced::Result {
         _ => log::LevelFilter::Trace,
     };
     if args.model.is_some() {
-        unsafe { MODEL_PATH = args.model }
+        *MODEL_PATH.lock().unwrap() = args.model;
     }
 
     capture::INIT_LOGGER.call_once(|| {

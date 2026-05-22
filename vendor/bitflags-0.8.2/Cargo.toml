@@ -1,0 +1,10 @@
+[package]
+name = "bitflags"
+version = "0.8.2"
+edition = "2021"
+license = "MIT/Apache-2.0"
+description = "Compatibility shim for bitflags 0.8 macro syntax"
+
+[lib]
+name = "bitflags"
+path = "src/lib.rs"
