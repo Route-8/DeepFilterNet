@@ -207,7 +207,7 @@ impl Default for RuntimeParams {
     }
 }
 
-pub type TractModel = TypedSimpleState<TypedModel, TypedSimplePlan<TypedModel>>;
+pub type TractModel = TypedSimpleState;
 
 #[derive(Clone)]
 pub struct DfTract {
@@ -273,9 +273,9 @@ impl DfTract {
         )?;
         let df_dec =
             init_df_decoder_from_read(&mut Cursor::new(dfp.df_dec), model_cfg, df_cfg, ch)?;
-        let enc = SimpleState::new(enc.into_runnable()?)?;
-        let erb_dec = SimpleState::new(erb_dec.into_runnable()?)?;
-        let df_dec = SimpleState::new(df_dec.into_runnable()?)?;
+        let enc = enc.into_runnable()?.spawn()?;
+        let erb_dec = erb_dec.into_runnable()?.spawn()?;
+        let df_dec = df_dec.into_runnable()?.spawn()?;
         #[cfg(feature = "timings")]
         let t1 = Instant::now();
 
@@ -457,13 +457,15 @@ impl DfTract {
     ///     - gains: Gain estimates of shape `[n_ch, 1, 1, n_erb]`.
     ///     - coefs: Real-valued DF coefficients estimates of shape `[n_ch, 1, 1, n_erb, 2]`.
     pub fn process_raw(&mut self) -> Result<(f32, Option<Tensor>, Option<Tensor>)> {
-        let spec = self.spec_buf.to_array_view()?;
+        let spec = self.spec_buf.to_plain_array_view()?;
         let ch = spec.len_of(Axis(0));
 
+        let mut erb_view = tvalue_to_array_view_mut(&mut self.erb_buf);
+        let mut cplx_view = tvalue_to_array_view_mut(&mut self.cplx_buf);
         for (nsy_ch, mut erb_ch, mut cplx_ch, state) in izip!(
             spec.axis_iter(Axis(0)),
-            tvalue_to_array_view_mut(&mut self.erb_buf).axis_iter_mut(Axis(0)),
-            tvalue_to_array_view_mut(&mut self.cplx_buf).axis_iter_mut(Axis(0)),
+            erb_view.axis_iter_mut(Axis(0)),
+            cplx_view.axis_iter_mut(Axis(0)),
             self.df_states.iter_mut()
         ) {
             let nsy_ch = as_slice_complex(nsy_ch.as_slice().unwrap());
@@ -477,7 +479,12 @@ impl DfTract {
         // Run encoder
         let mut enc_emb = self.enc.run(tvec!(self.erb_buf.clone(), self.cplx_buf.clone()))?;
 
-        let &lsnr = enc_emb.pop().unwrap().to_scalar::<f32>()?;
+        let &lsnr = enc_emb
+            .pop()
+            .unwrap()
+            .as_plain()
+            .context("lsnr tensor storage must be plain")?
+            .to_scalar::<f32>()?;
         let c0 = enc_emb.pop().unwrap();
         let emb = enc_emb.pop().unwrap();
 
@@ -553,9 +560,10 @@ impl DfTract {
             .pop_front()
             .expect("rolling_spec_buf_x should never be empty during process()");
 
+        let mut spec_view = self.spec_buf.to_plain_array_view_mut()?;
         for (ns_ch, mut rbuf, state) in izip!(
             noisy.axis_iter(Axis(0)),
-            self.spec_buf.to_array_view_mut()?.axis_iter_mut(Axis(0)),
+            spec_view.axis_iter_mut(Axis(0)),
             self.df_states.iter_mut(),
         ) {
             let spec = as_slice_mut_complex(rbuf.as_slice_mut().unwrap());
@@ -564,9 +572,21 @@ impl DfTract {
 
         // Copy spec_buf data into recycled tensors (no heap allocation)
         {
-            let src = self.spec_buf.as_slice::<f32>()?;
-            recycled_y.as_slice_mut::<f32>()?.copy_from_slice(src);
-            recycled_x.as_slice_mut::<f32>()?.copy_from_slice(src);
+            let src = self
+                .spec_buf
+                .as_plain()
+                .context("spec_buf storage must be plain")?
+                .as_slice::<f32>()?;
+            recycled_y
+                .as_plain_mut()
+                .context("recycled tensor storage must be plain")?
+                .as_slice_mut::<f32>()?
+                .copy_from_slice(src);
+            recycled_x
+                .as_plain_mut()
+                .context("recycled tensor storage must be plain")?
+                .as_slice_mut::<f32>()?
+                .copy_from_slice(src);
         }
 
         self.rolling_spec_buf_y.push_back(recycled_y);
@@ -583,9 +603,9 @@ impl DfTract {
             .rolling_spec_buf_y
             .get_mut(self.df_order - 1)
             .unwrap()
-            .to_array_view_mut()?;
+            .to_plain_array_view_mut()?;
         if let Some(gains) = gains {
-            let mut gains = gains.into_array()?;
+            let mut gains = gains.into_plain_array()?;
             if gains.shape()[0] < noisy.shape()[0] {
                 // Mask was reduced to single channel
                 let gain_slc = gains.as_slice_mut().unwrap();
@@ -631,14 +651,14 @@ impl DfTract {
             self.rolling_spec_buf_x
                 .get(self.lookahead.max(self.df_order) - self.lookahead - 1)
                 .unwrap()
-                .to_array_view::<f32>()
+                .to_plain_array_view::<f32>()
                 .unwrap(),
             &[self.ch, self.n_freqs],
         )
         .into_dimensionality::<Ix2>()
         .unwrap();
         let mut spec_enh = as_arrayview_mut_complex(
-            self.spec_buf.to_array_view_mut::<f32>().unwrap(),
+            self.spec_buf.to_plain_array_view_mut::<f32>().unwrap(),
             &[self.ch, self.n_freqs],
         )
         .into_dimensionality::<Ix2>()
@@ -704,7 +724,7 @@ impl DfTract {
         debug_assert_eq!(self.spec_buf.shape(), spec.shape());
         let mut buf = self
             .spec_buf
-            .to_array_view_mut()?
+            .to_plain_array_view_mut()?
             .into_shape_with_order([self.ch, self.n_freqs])?;
         for (i_ch, mut b_ch) in spec.outer_iter().zip(buf.outer_iter_mut()) {
             for (&i, b) in i_ch.iter().zip(b_ch.iter_mut()) {
@@ -719,7 +739,7 @@ impl DfTract {
             self.rolling_spec_buf_x
                 .get(self.lookahead.max(self.df_order) - self.lookahead - 1)
                 .unwrap()
-                .to_array_view::<f32>()
+                .to_plain_array_view::<f32>()
                 .unwrap(),
             &[self.ch, self.n_freqs],
         )
@@ -728,7 +748,7 @@ impl DfTract {
     }
     pub fn get_spec_enh(&self) -> ArrayView2<Complex32> {
         as_arrayview_complex(
-            self.spec_buf.to_array_view::<f32>().unwrap(),
+            self.spec_buf.to_plain_array_view::<f32>().unwrap(),
             &[self.ch, self.n_freqs],
         )
         .into_dimensionality::<Ix2>()
@@ -736,7 +756,7 @@ impl DfTract {
     }
     pub fn get_mut_spec_enh(&mut self) -> ArrayViewMut2<Complex32> {
         as_arrayview_mut_complex(
-            self.spec_buf.to_array_view_mut::<f32>().unwrap(),
+            self.spec_buf.to_plain_array_view_mut::<f32>().unwrap(),
             &[self.ch, self.n_freqs],
         )
         .into_dimensionality::<Ix2>()
@@ -770,16 +790,16 @@ fn df(
     debug_assert_eq!(ch, spec_out.shape()[0]);
     debug_assert!(spec.len() >= df_order);
     let mut o_f: ArrayViewMut2<Complex32> =
-        as_arrayview_mut_complex(spec_out.to_array_view_mut::<f32>()?, &[ch, n_freqs])
+        as_arrayview_mut_complex(spec_out.to_plain_array_view_mut::<f32>()?, &[ch, n_freqs])
             .into_dimensionality()?;
     // Zero relevant frequency bins of output
     o_f.slice_mut(s![.., ..nb_df]).fill(Complex32::default());
     let coefs_arr: ArrayView3<Complex32> =
-        as_arrayview_complex(coefs.to_array_view::<f32>()?, &[ch, nb_df, df_order])
+        as_arrayview_complex(coefs.to_plain_array_view::<f32>()?, &[ch, nb_df, df_order])
             .into_dimensionality()?;
     // Transform spec to an complex array and iterate over time frames of spec and coefs
     let spec_iter = spec.iter().map(|s| {
-        as_arrayview_complex(s.to_array_view::<f32>().unwrap(), &[ch, n_freqs])
+        as_arrayview_complex(s.to_plain_array_view::<f32>().unwrap(), &[ch, n_freqs])
             .into_dimensionality::<Ix2>()
             .unwrap()
     });
@@ -820,7 +840,7 @@ fn init_encoder_impl(
         .with_input_fact(0, feat_erb)?
         .with_input_fact(1, feat_spec)?
         .with_input_names(["feat_erb", "feat_spec"])?
-        .with_output_names(["e0", "e1", "e2", "e3", "emb", "c0", "lsnr"])?;
+        .with_outputs_by_name(["e0", "e1", "e2", "e3", "emb", "c0", "lsnr"])?;
 
     m.analyse(true)?;
     let mut m = m.into_typed()?;
@@ -886,7 +906,7 @@ fn init_erb_decoder_impl(
         .with_input_fact(3, e1)?
         .with_input_fact(4, e0)?
         .with_input_names(["emb", "e3", "e2", "e1", "e0"])?;
-    // .with_output_names([output_name])?;
+    // .with_outputs_by_name([output_name])?;
 
     m.analyse(true)?;
 
@@ -932,7 +952,7 @@ fn init_erb_decoder_impl(
             _ => (),
         }
     }
-    m = m.with_output_names(&[output_name])?;
+    m = m.with_outputs_by_name(&[output_name])?;
 
     let m = m.into_optimized()?;
 
@@ -988,7 +1008,7 @@ fn init_df_decoder_impl(
         .with_input_fact(0, emb)?
         .with_input_fact(1, c0)?
         .with_input_names(["emb", "c0"])?
-        .with_output_names(["coefs"])?;
+        .with_outputs_by_name(["coefs"])?;
 
     m.analyse(true)?;
     let mut m = m.into_typed()?;
