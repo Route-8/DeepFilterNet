@@ -51,6 +51,7 @@ dataset = [
   "dep:anyhow",
 ]
 timings = []
+wasm-simd = ["realfft/wasm_simd"]
 logging = ["dep:log", "dep:crossbeam-channel"]
 vorbis = ["dep:lewton", "dep:ogg"]
 flac = ["dep:claxon"]

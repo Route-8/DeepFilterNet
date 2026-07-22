@@ -5,9 +5,6 @@ use wasm_bindgen::prelude::*;
 
 use crate::tract::*;
 
-#[cfg(feature = "wasm")]
-use console_error_panic_hook;
-
 // Initialize panic hook for better error reporting in browser console
 #[wasm_bindgen(start)]
 pub fn init_panic_hook() {

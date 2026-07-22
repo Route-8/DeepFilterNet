@@ -197,7 +197,11 @@ impl RuntimeParams {
             min_db_thresh: -10.,
             max_db_erb_thresh: 30.,
             max_db_df_thresh: 20.,
-            reduce_mask: ReduceMask::MEAN,
+            reduce_mask: if channels == 1 {
+                ReduceMask::NONE
+            } else {
+                ReduceMask::MEAN
+            },
         }
     }
 }
@@ -243,6 +247,19 @@ pub struct DfTract {
     rolling_spec_buf_x: VecDeque<Tensor>, // Noisy spec buf
     skip_counter: usize,  // Increment when wanting to skip processing due to low RMS
     synthesis_tmp: Vec<Complex32>, // Pre-allocated buffer for synthesis input (len = n_freqs)
+}
+
+#[inline]
+fn copy_plain_tensor(dst: &mut Tensor, src: &Tensor) -> Result<()> {
+    dst.as_plain_mut()
+        .context("destination tensor storage must be plain")?
+        .as_slice_mut::<f32>()?
+        .copy_from_slice(
+            src.as_plain()
+                .context("source tensor storage must be plain")?
+                .as_slice::<f32>()?,
+        );
+    Ok(())
 }
 
 #[cfg(all(not(feature = "capi"), feature = "default-model"))]
@@ -457,6 +474,13 @@ impl DfTract {
     ///     - gains: Gain estimates of shape `[n_ch, 1, 1, n_erb]`.
     ///     - coefs: Real-valued DF coefficients estimates of shape `[n_ch, 1, 1, n_erb, 2]`.
     pub fn process_raw(&mut self) -> Result<(f32, Option<Tensor>, Option<Tensor>)> {
+        self.process_raw_impl(true)
+    }
+
+    fn process_raw_impl(
+        &mut self,
+        return_zero_mask: bool,
+    ) -> Result<(f32, Option<Tensor>, Option<Tensor>)> {
         let spec = self.spec_buf.to_plain_array_view()?;
         let ch = spec.len_of(Axis(0));
 
@@ -510,7 +534,7 @@ impl DfTract {
             m.remove_axis(1)?;
             m.remove_axis(1)?;
             Some(m)
-        } else if apply_gain_zeros {
+        } else if apply_gain_zeros && return_zero_mask {
             Some(Tensor::zero::<f32>(&[self.ch, self.nb_erb])?)
         } else {
             None
@@ -571,23 +595,8 @@ impl DfTract {
         }
 
         // Copy spec_buf data into recycled tensors (no heap allocation)
-        {
-            let src = self
-                .spec_buf
-                .as_plain()
-                .context("spec_buf storage must be plain")?
-                .as_slice::<f32>()?;
-            recycled_y
-                .as_plain_mut()
-                .context("recycled tensor storage must be plain")?
-                .as_slice_mut::<f32>()?
-                .copy_from_slice(src);
-            recycled_x
-                .as_plain_mut()
-                .context("recycled tensor storage must be plain")?
-                .as_slice_mut::<f32>()?
-                .copy_from_slice(src);
-        }
+        copy_plain_tensor(&mut recycled_y, &self.spec_buf)?;
+        copy_plain_tensor(&mut recycled_x, &self.spec_buf)?;
 
         self.rolling_spec_buf_y.push_back(recycled_y);
         self.rolling_spec_buf_x.push_back(recycled_x);
@@ -596,19 +605,19 @@ impl DfTract {
             return Ok(35.);
         }
 
-        let (lsnr, gains, coefs) = self.process_raw()?;
+        let (lsnr, gains, coefs) = self.process_raw_impl(false)?;
 
-        let (apply_erb, _, _) = self.apply_stages(lsnr);
+        let (apply_erb, apply_gain_zeros, _) = self.apply_stages(lsnr);
         let mut spec = self
             .rolling_spec_buf_y
             .get_mut(self.df_order - 1)
             .unwrap()
             .to_plain_array_view_mut()?;
         if let Some(gains) = gains {
-            let mut gains = gains.into_plain_array()?;
+            let gains = gains.to_plain_array_view::<f32>()?;
             if gains.shape()[0] < noisy.shape()[0] {
                 // Mask was reduced to single channel
-                let gain_slc = gains.as_slice_mut().unwrap();
+                let gain_slc = gains.as_slice().unwrap();
                 for mut spec_ch in spec.axis_iter_mut(Axis(0)) {
                     self.df_states[0].apply_mask(
                         as_slice_mut_complex(spec_ch.as_slice_mut().unwrap()),
@@ -628,6 +637,14 @@ impl DfTract {
                 }
             }
             self.skip_counter = 0;
+        } else if apply_gain_zeros {
+            for mut spec_ch in spec.axis_iter_mut(Axis(0)) {
+                self.df_states[0].apply_mask(
+                    as_slice_mut_complex(spec_ch.as_slice_mut().unwrap()),
+                    &self.m_zeros,
+                );
+            }
+            self.skip_counter = 0;
         } else {
             // gains are None => skipped due to LSNR
             self.skip_counter += 1;
@@ -635,7 +652,7 @@ impl DfTract {
 
         // This spectrum will only be used for the upper frequecies
         let spec = self.rolling_spec_buf_y.get_mut(self.df_order - 1).unwrap();
-        self.spec_buf.clone_from(spec);
+        copy_plain_tensor(&mut self.spec_buf, spec)?;
         if let Some(coefs) = coefs {
             df(
                 &self.rolling_spec_buf_x,
@@ -1127,6 +1144,124 @@ pub fn tvalue_to_array_view_mut(x: &mut TValue) -> ArrayViewMutD<f32> {
             TValue::Const(x) => {
                 ArrayViewMutD::from_shape_ptr(x.shape(), x.as_ptr_unchecked::<f32>() as *mut f32)
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_params_use_identity_reduction_for_mono() {
+        assert!(matches!(
+            RuntimeParams::default_with_ch(1).reduce_mask,
+            ReduceMask::NONE
+        ));
+        assert!(matches!(
+            RuntimeParams::default_with_ch(2).reduce_mask,
+            ReduceMask::MEAN
+        ));
+    }
+
+    #[test]
+    fn plain_tensor_copy_reuses_destination_allocation() {
+        let src = Tensor::from_shape(&[2, 3], &[1_f32, 2., 3., 4., 5., 6.]).unwrap();
+        let mut dst = Tensor::zero::<f32>(&[2, 3]).unwrap();
+        let ptr_before = dst.as_plain().unwrap().as_slice::<f32>().unwrap().as_ptr();
+
+        copy_plain_tensor(&mut dst, &src).unwrap();
+
+        let dst_slice = dst.as_plain().unwrap().as_slice::<f32>().unwrap();
+        assert_eq!(dst_slice.as_ptr(), ptr_before);
+        assert_eq!(
+            dst_slice,
+            src.as_plain().unwrap().as_slice::<f32>().unwrap()
+        );
+    }
+
+    #[cfg(feature = "default-model")]
+    fn standard_model_params() -> DfParams {
+        DfParams::from_bytes(include_bytes!("../../models/DeepFilterNet3_onnx.tar.gz"))
+            .expect("standard model should load")
+    }
+
+    #[cfg(feature = "default-model")]
+    fn deterministic_frame(frame_index: usize, hop_size: usize) -> Array2<f32> {
+        Array2::from_shape_fn((1, hop_size), |(_, sample_index)| {
+            let sample_index = (frame_index * hop_size + sample_index) as f32;
+            0.2 * (sample_index * 0.017).sin() + 0.1 * (sample_index * 0.031).cos()
+        })
+    }
+
+    #[cfg(feature = "default-model")]
+    #[test]
+    fn mono_identity_reduction_matches_mean_end_to_end() {
+        let params = standard_model_params();
+        let thresholds = (-f32::MAX, f32::MAX, f32::MAX);
+        let identity_params = RuntimeParams::default_with_ch(1).with_thresholds(
+            thresholds.0,
+            thresholds.1,
+            thresholds.2,
+        );
+        let mean_params = RuntimeParams::default_with_ch(1)
+            .with_mask_reduce(ReduceMask::MEAN)
+            .with_thresholds(thresholds.0, thresholds.1, thresholds.2);
+        let mut identity = DfTract::new(params.clone(), &identity_params).unwrap();
+        let mut mean = DfTract::new(params, &mean_params).unwrap();
+        let frame_count = identity.df_order + identity.lookahead + 3;
+        let mut saw_nonzero_output = false;
+
+        for frame_index in 0..frame_count {
+            let input = deterministic_frame(frame_index, identity.hop_size);
+            let mut identity_output = Array2::zeros((1, identity.hop_size));
+            let mut mean_output = Array2::zeros((1, mean.hop_size));
+
+            let identity_lsnr = identity.process(input.view(), identity_output.view_mut()).unwrap();
+            let mean_lsnr = mean.process(input.view(), mean_output.view_mut()).unwrap();
+
+            assert_eq!(identity_lsnr.to_bits(), mean_lsnr.to_bits());
+            assert_eq!(identity_output.as_slice(), mean_output.as_slice());
+            saw_nonzero_output |= identity_output.iter().any(|sample| *sample != 0.0);
+        }
+
+        assert!(
+            saw_nonzero_output,
+            "comparison never reached synthesized audio"
+        );
+    }
+
+    #[cfg(feature = "default-model")]
+    #[test]
+    fn low_snr_reuses_zero_mask_without_changing_raw_api() {
+        let runtime =
+            RuntimeParams::default_with_ch(1).with_thresholds(f32::MAX, f32::MAX, f32::MAX);
+        let mut raw = DfTract::new(standard_model_params(), &runtime).unwrap();
+        let mut reused = raw.clone();
+
+        let (raw_lsnr, raw_gains, raw_coefs) = raw.process_raw().unwrap();
+        let (reused_lsnr, reused_gains, reused_coefs) = reused.process_raw_impl(false).unwrap();
+        let raw_gains = raw_gains.expect("public raw API should return a zero mask");
+
+        assert_eq!(raw_lsnr.to_bits(), reused_lsnr.to_bits());
+        assert_eq!(raw_gains.shape(), &[1, raw.nb_erb]);
+        assert!(raw_gains
+            .as_plain()
+            .unwrap()
+            .as_slice::<f32>()
+            .unwrap()
+            .iter()
+            .all(|gain| *gain == 0.0));
+        assert!(raw_coefs.is_none());
+        assert!(reused_gains.is_none());
+        assert!(reused_coefs.is_none());
+
+        let frame_count = reused.df_order + reused.conv_lookahead + 2;
+        for frame_index in 0..frame_count {
+            let input = deterministic_frame(frame_index, reused.hop_size);
+            let mut output = Array2::zeros((1, reused.hop_size));
+            reused.process(input.view(), output.view_mut()).unwrap();
+            assert!(output.iter().all(|sample| *sample == 0.0));
         }
     }
 }
