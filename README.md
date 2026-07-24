@@ -40,6 +40,16 @@ cargo +nightly run -p df-demo --features ui --bin df-demo --release
 
 ## Usage
 
+### Rust and WebAssembly
+
+The DeepFilterNet Rust crates require Rust 1.91 or newer. WebAssembly consumers can enable
+`wasm-simd` to select RustFFT's fixed-width SIMD implementation explicitly; generated modules then
+require a runtime with WebAssembly SIMD support. The `wasm` feature retains the existing
+slice-based JavaScript API and also exposes persistent input/output frame pointers for callers that
+need an allocation-free audio boundary. Persistent views remain valid until WASM memory grows or
+the owning state is released with `df_destroy`; recreate views after memory growth and never use
+them after destroying the state.
+
 ### deep-filter
 
 Download a pre-compiled deep-filter binary from the [release page](https://github.com/Rikorose/DeepFilterNet/releases/).

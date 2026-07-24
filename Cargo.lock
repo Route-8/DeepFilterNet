@@ -1200,6 +1200,7 @@ dependencies = [
  "js-sys",
  "lewton",
  "log",
+ "ndarray 0.15.6",
  "ndarray 0.17.2",
  "num-complex",
  "ogg",

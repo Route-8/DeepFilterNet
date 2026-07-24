@@ -22,13 +22,34 @@ jobs:
           - {command: black, args: "--check --diff ."}
           - {command: isort, args: ". --check --diff"}
     steps:
-     - uses: actions/checkout@v4
-     - uses: actions/setup-python@v5
-       with:
-         python-version: "3.9"
-         cache: 'pip'
-         cache-dependency-path: '**/pyproject.toml'
-     - name: Install
-       run: pip install ${{matrix.command}}
-     - name: Run ${{matrix.command}}
-       run: ${{matrix.command}} ${{matrix.args}}
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: 'pip'
+          cache-dependency-path: '**/pyproject.toml'
+      - name: Install
+        run: pip install ${{ matrix.command }}
+      - name: Run ${{matrix.command}}
+        run: ${{ matrix.command }} ${{ matrix.args }}
+
+  dataloader-threading:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install libhdf5-dev
+          python -m pip install numpy pytest
+      - name: Build dataloader extension
+        run: cargo build -p DeepFilterDataLoader
+      - name: Test cross-thread batch loading
+        run: |
+          python -c $'import importlib.util\nimport pathlib\nimport sys\nimport pytest\n\nroot = pathlib.Path.cwd()\nspec = importlib.util.spec_from_file_location("libdfdata", root / "target/debug/liblibdfdata.so")\nmodule = importlib.util.module_from_spec(spec)\nsys.modules["libdfdata"] = module\nspec.loader.exec_module(module)\nraise SystemExit(pytest.main(["-q", "pyDF-data/tests/test_cross_thread.py"]))'

@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::Instant;
 
@@ -21,12 +22,20 @@ fn libdfdata(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-#[pyclass(unsendable)]
+#[pyclass]
 struct _FdDataLoader {
-    loader: DataLoader,
+    loader: Mutex<DataLoader>,
     finished: bool,
     logger: Receiver<LogMessage>,
 }
+
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    const fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send::<DataLoader>();
+    assert_send_sync::<_FdDataLoader>();
+};
 
 // TODO: Does not work due to pyo3 restrictions; instead return tuples
 // #[pyclass]
@@ -210,7 +219,7 @@ impl _FdDataLoader {
         py.check_signals()?;
         let loader = dl_builder.build().to_py_err()?;
         Ok(_FdDataLoader {
-            loader,
+            loader: Mutex::new(loader),
             finished: false,
             logger: log_receiver,
         })
@@ -218,7 +227,7 @@ impl _FdDataLoader {
 
     fn start_epoch(&mut self, split: &str, seed: usize) -> PyResult<()> {
         self.finished = false;
-        match self.loader.start_epoch(split, seed) {
+        match self.lock_loader()?.start_epoch(split, seed) {
             Err(e) => Err(PyValueError::new_err(e.to_string())),
             Ok(()) => Ok(()),
         }
@@ -229,7 +238,8 @@ impl _FdDataLoader {
         if self.finished {
             return Err(PyStopIteration::new_err("Epoch finished"));
         }
-        match self.loader.get_batch::<Complex32>().to_py_err()? {
+        let batch = py.detach(|| self.lock_loader()?.get_batch::<Complex32>().to_py_err())?;
+        match batch {
             Some(batch) => {
                 let erb = batch.feat_erb.unwrap_or_else(|| ArrayD::zeros(vec![1, 1, 1, 1]));
                 let spec = batch.feat_spec.unwrap_or_else(|| ArrayD::zeros(vec![1, 1, 1, 1]));
@@ -253,25 +263,25 @@ impl _FdDataLoader {
         }
     }
 
-    fn cleanup(&mut self) -> PyResult<()> {
-        self.loader.join_fill_thread().to_py_err()?;
+    fn cleanup(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.lock_loader()?.join_fill_thread().to_py_err())
+    }
+
+    fn dataloader_len(&self, split: &str) -> PyResult<usize> {
+        Ok(self.lock_loader()?.dataloader_len(split))
+    }
+
+    fn dataset_len(&self, split: &str) -> PyResult<usize> {
+        Ok(self.lock_loader()?.dataset_len(split))
+    }
+
+    fn set_batch_size(&mut self, batch_size: usize, split: &str) -> PyResult<()> {
+        self.lock_loader()?.set_batch_size(batch_size, split);
         Ok(())
     }
 
-    fn dataloader_len(&self, split: &str) -> usize {
-        self.loader.dataloader_len(split)
-    }
-
-    fn dataset_len(&self, split: &str) -> usize {
-        self.loader.dataset_len(split)
-    }
-
-    fn set_batch_size(&mut self, batch_size: usize, split: &str) {
-        self.loader.set_batch_size(batch_size, split)
-    }
-
-    fn batch_size(&self, split: &str) -> usize {
-        self.loader.batch_size(split)
+    fn batch_size(&self, split: &str) -> PyResult<usize> {
+        Ok(self.lock_loader()?.batch_size(split))
     }
 
     fn get_log_messages(&mut self) -> Vec<(String, String, Option<String>, Option<u32>)> {
@@ -292,6 +302,14 @@ impl _FdDataLoader {
             }
         }
         messages
+    }
+}
+
+impl _FdDataLoader {
+    fn lock_loader(&self) -> PyResult<MutexGuard<'_, DataLoader>> {
+        self.loader
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("DF dataloader lock poisoned"))
     }
 }
 

@@ -1718,6 +1718,13 @@ impl Hdf5Dataset {
             n => return Err(DfDatasetError::PcmUnspportedDimension(n)),
         })
     }
+    fn convert_hdf5_array(arr: ndarray_015::ArrayD<f32>) -> Result<ArrayD<f32>> {
+        let shape = arr.shape().to_vec();
+        Ok(ArrayD::from_shape_vec(
+            IxDyn(&shape),
+            arr.iter().copied().collect(),
+        )?)
+    }
     /// Read a PCM encoded sample from an `hdf5::Dataset`.
     ///
     /// Arguments:
@@ -1732,25 +1739,43 @@ impl Hdf5Dataset {
         r: Option<Range<usize>>,
     ) -> Result<Array2<f32>> {
         let ds = self.ds(key)?;
-        let mut arr = {
-            let arr = ds.read_dyn::<f32>()?;
-            let shape = arr.shape().to_vec();
-            ArrayD::from_shape_vec(IxDyn(&shape), arr.iter().copied().collect())?
-        };
-        if let Some(r) = r {
-            if r.end > *ds.shape().last().unwrap_or(&0) {
+        let shape = ds.shape();
+        let sample_count = *shape.last().unwrap_or(&0);
+        if let Some(r) = r.as_ref() {
+            if r.end > sample_count {
                 return Err(DfDatasetError::PcmRangeToLarge {
-                    range: r,
-                    size: ds.shape(),
+                    range: r.clone(),
+                    size: shape,
                 });
             }
-            match ds.ndim() {
-                1 => arr.slice_axis_inplace(Axis(0), Slice::from(r)),
-                2 => arr.slice_axis_inplace(Axis(1), Slice::from(r)),
-                n => return Err(DfDatasetError::PcmUnspportedDimension(n)),
-            }
         }
-        let mut arr = self.match_ch(arr, 0, channel)?;
+        let sample_range = r.unwrap_or(0..sample_count);
+        let selection: hdf5::Selection = match ds.ndim() {
+            1 => sample_range.into(),
+            2 => {
+                let channel_range = match channel {
+                    Some(-1) => {
+                        let idx = thread_rng()?.uniform(0, shape[0]);
+                        idx..idx + 1
+                    }
+                    Some(idx) => {
+                        let idx = if idx < 0 {
+                            (shape[0] as isize).saturating_add(idx) as usize
+                        } else {
+                            idx as usize
+                        };
+                        idx..idx.saturating_add(1)
+                    }
+                    None => 0..shape[0],
+                };
+                hdf5::Hyperslab::new(vec![channel_range.into(), sample_range.into()]).into()
+            }
+            n => return Err(DfDatasetError::PcmUnspportedDimension(n)),
+        };
+
+        // Select on disk before copying from HDF5's ndarray 0.15 into ndarray 0.17.
+        let arr = ds.read_slice::<f32, _, ndarray_015::IxDyn>(selection)?;
+        let mut arr = self.match_ch(Self::convert_hdf5_array(arr)?, 0, None)?;
         match self.dtype {
             Some(DType::I16) => arr /= i16::MAX as f32,
             Some(DType::F32) => (),
@@ -2084,6 +2109,8 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Once;
 
     use rstest::rstest;
@@ -2093,6 +2120,45 @@ mod tests {
     use crate::wav_utils::*;
 
     static INIT: Once = Once::new();
+    static TEST_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct PcmTestFile(PathBuf);
+
+    impl Drop for PcmTestFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn create_pcm_test_dataset<T: hdf5::H5Type>(
+        shape: &[usize],
+        data: &[T],
+        dtype: Option<DType>,
+    ) -> Result<(PcmTestFile, Hdf5Dataset)> {
+        let id = TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "deep-filter-pcm-range-{}-{id}.hdf5",
+            std::process::id()
+        ));
+        let file = File::create(&path)?;
+        let group = file.create_group("noise")?;
+        let ds = group.new_dataset::<T>().shape(shape).create("sample")?;
+        ds.write_raw(data)?;
+        drop(ds);
+        drop(group);
+
+        Ok((
+            PcmTestFile(path),
+            Hdf5Dataset {
+                file,
+                dstype: DsType::Noise,
+                sr: None,
+                codec: Some(Codec::PCM),
+                max_freq: None,
+                dtype,
+            },
+        ))
+    }
 
     /// Setup function that is only run once, even if called multiple times.
     fn setup() {
@@ -2203,6 +2269,67 @@ mod tests {
             assert_eq!(sample_hdf5, samples_raw);
             assert!(dbg!(calc_snr_sx(samples_raw.iter(), sample_hdf5.iter())) > 100.);
         }
+        Ok(())
+    }
+    #[test]
+    fn test_hdf5_read_pcm_large_short_range_and_channels() -> Result<()> {
+        let channels = 4;
+        let samples = 1_000_000;
+        let data: Vec<i16> = (0..channels)
+            .flat_map(|channel| {
+                (0..samples).map(move |sample| (channel * 1_000 + sample % 997) as i16)
+            })
+            .collect();
+        let (_file, hdf5) = create_pcm_test_dataset(&[channels, samples], &data, None)?;
+        let range = 543_210..543_218;
+        let expected = Array2::from_shape_fn((channels, range.len()), |(channel, sample)| {
+            data[channel * samples + range.start + sample] as f32 / i16::MAX as f32
+        });
+
+        let all = hdf5.read_pcm("sample", None, Some(range.clone()))?;
+        assert_eq!(all, expected);
+
+        let selected = hdf5.read_pcm("sample", Some(2), Some(range.clone()))?;
+        assert_eq!(selected, expected.slice(s![2..3, ..]));
+
+        let negative = hdf5.read_pcm("sample", Some(-2), Some(range.clone()))?;
+        assert_eq!(negative, expected.slice(s![2..3, ..]));
+
+        seed_from_u64(0);
+        let random = hdf5.read_pcm("sample", Some(-1), Some(range))?;
+        assert_eq!(random.shape(), &[1, 8]);
+        assert!(expected.rows().into_iter().any(|row| row == random.row(0)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_hdf5_read_pcm_1d_range_validation_and_dtype_normalization() -> Result<()> {
+        let data: Vec<f32> = (0..32).map(|sample| sample as f32 * 100.).collect();
+        let (_file, hdf5) = create_pcm_test_dataset(&[data.len()], &data, Some(DType::I16))?;
+
+        let range = 7..12;
+        let samples = hdf5.read_pcm("sample", Some(-1), Some(range.clone()))?;
+        let expected = Array2::from_shape_fn((1, range.len()), |(_, sample)| {
+            data[range.start + sample] / i16::MAX as f32
+        });
+        assert_eq!(samples, expected);
+
+        let empty = hdf5.read_pcm("sample", None, Some(12..12))?;
+        assert_eq!(empty.shape(), &[1, 0]);
+
+        let err = hdf5.read_pcm("sample", None, Some(0..data.len() + 1)).unwrap_err();
+        assert!(matches!(
+            err,
+            DfDatasetError::PcmRangeToLarge { range, size }
+                if range == (0..data.len() + 1) && size == vec![data.len()]
+        ));
+
+        let raw_i16 = [100_i16, -200, 300, -400];
+        let (_file, hdf5) = create_pcm_test_dataset(&[2, 2], &raw_i16, Some(DType::F32))?;
+        assert_eq!(
+            hdf5.read_pcm("sample", None, Some(0..2))?,
+            Array2::from_shape_vec((2, 2), raw_i16.iter().map(|&x| x as f32).collect())?
+        );
         Ok(())
     }
     #[test]

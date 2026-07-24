@@ -142,7 +142,7 @@ fn main() -> Result<()> {
         } else {
             let n_samples = args.num.unwrap_or_else(|| ds.len());
             if args.randomize {
-                (0..ds.len()).choose_multiple(&mut rng, n_samples)
+                (0..ds.len()).sample(&mut rng, n_samples)
             } else {
                 (0..n_samples).collect()
             }

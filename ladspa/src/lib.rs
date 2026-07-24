@@ -2,7 +2,8 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Write};
 use std::sync::{
-    mpsc::{sync_channel, Receiver, SyncSender},
+    atomic::{AtomicBool, Ordering},
+    mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError},
     Arc, Mutex, Once, OnceLock,
 };
 use std::thread::{self, sleep, JoinHandle};
@@ -20,8 +21,10 @@ type ControlProd = SyncSender<(DfControl, f32)>;
 type ControlRecv = Receiver<(DfControl, f32)>;
 #[cfg(feature = "dbus")]
 use ::{
-    event_listener::Event,
-    zbus::{blocking::ConnectionBuilder, dbus_interface},
+    event_listener::{Event, Listener},
+    zbus::{
+        blocking::connection::Builder as ConnectionBuilder, interface, object_server::Interface,
+    },
 };
 #[cfg(feature = "dbus")]
 const DBUS_NAME: &str = "org.deepfilter.DeepFilterLadspa";
@@ -59,13 +62,19 @@ struct DfPlugin {
     t_proc_change: usize,
     sleep_duration: Duration,
     control_hist: DfControlHistory,
-    _h: JoinHandle<()>, // Worker thread handle
+    cancelled: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+    worker_failed: bool,
     #[cfg(feature = "dbus")]
-    _dbus: Option<(JoinHandle<()>, Arc<Event>)>, // dbus thread handle
+    dbus: Option<(JoinHandle<()>, Arc<Event>, Arc<AtomicBool>)>,
 }
 
 const ID_MONO: u64 = 7843795;
 const ID_STEREO: u64 = 7843796;
+const WORKER_INIT_TIMEOUT: Duration = Duration::from_secs(60);
+const WORKER_STALL_FRAMES: u32 = 10;
+#[cfg(feature = "dbus")]
+const DBUS_INIT_TIMEOUT: Duration = Duration::from_secs(5);
 static DF_PARAMS: OnceLock<DfParams> = OnceLock::new();
 
 fn log_format(buf: &mut env_logger::fmt::Formatter, record: &log::Record) -> io::Result<()> {
@@ -101,6 +110,7 @@ fn syslog_format(buf: &mut env_logger::fmt::Formatter, record: &log::Record) -> 
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn get_worker_fn(
     inqueue: SampleQueue,
     outqueue: SampleQueue,
@@ -109,15 +119,33 @@ fn get_worker_fn(
     controls: ControlRecv,
     sleep_duration: Duration,
     id: String,
-) -> impl FnOnce() {
-    move || {
+    cancelled: Arc<AtomicBool>,
+) -> (impl FnOnce(), Receiver<Result<(), String>>) {
+    let (ready_tx, ready_rx) = sync_channel(1);
+    let worker = move || {
         let r_params = RuntimeParams::default_with_ch(channels);
-        let mut df =
-            DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime");
+        let mut df = match DfTract::new(df_params, &r_params) {
+            Ok(df) => df,
+            Err(error) => {
+                let error = error.to_string();
+                log::error!("DF {id} | Could not initialize DeepFilter runtime: {error}");
+                let _ = ready_tx.send(Err(error));
+                return;
+            }
+        };
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
         let mut inframe = Array2::zeros((df.ch, df.hop_size));
         let mut outframe = Array2::zeros((df.ch, df.hop_size));
         let t_audio_ms = df.hop_size as f32 / df.sr as f32 * 1000.;
+        if ready_tx.send(Ok(())).is_err() {
+            return;
+        }
         loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return;
+            }
             if let Ok((c, v)) = controls.try_recv() {
                 log::info!("DF {} | Setting '{}' to {:.1}", id, c, v);
                 match c {
@@ -168,7 +196,8 @@ fn get_worker_fn(
                 td_ms / t_audio_ms
             );
         }
-    }
+    };
+    (worker, ready_rx)
 }
 
 /// Initialize DF model and returns sample rate and frame size
@@ -177,6 +206,22 @@ fn init_df_params() -> (DfParams, usize, usize) {
     let (sr, frame_size, _) =
         df_params.runtime_info().expect("Could not read DeepFilter model runtime info");
     (df_params, sr, frame_size)
+}
+
+fn wait_for_worker_ready(
+    ready: &Receiver<Result<(), String>>,
+    timeout: Duration,
+) -> Result<(), String> {
+    match ready.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Disconnected) => {
+            Err("DeepFilter worker terminated before initialization completed".to_string())
+        }
+        Err(RecvTimeoutError::Timeout) => Err(format!(
+            "DeepFilter worker initialization timed out after {:.1}s",
+            timeout.as_secs_f32()
+        )),
+    }
 }
 
 fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
@@ -214,8 +259,9 @@ fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
         let id = Uuid::new_v4().as_urn().to_string().split_at(33).1.to_string();
 
         let (control_tx, control_rx) = sync_channel(32);
+        let cancelled = Arc::new(AtomicBool::new(false));
 
-        let worker_handle = thread::spawn(get_worker_fn(
+        let (worker, ready_rx) = get_worker_fn(
             Arc::clone(&i_tx),
             Arc::clone(&o_rx),
             df_params,
@@ -223,13 +269,25 @@ fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
             control_rx,
             sleep_duration,
             id.clone(),
-        ));
-        let hist = DfControlHistory::default();
-        log::info!(
-            "DF {} | Initialized plugin in {:.1}ms",
-            &id,
-            t0.elapsed().as_secs_f32() * 1000.
+            Arc::clone(&cancelled),
         );
+        let worker_handle = thread::spawn(worker);
+        let worker_failed =
+            if let Err(error) = wait_for_worker_ready(&ready_rx, WORKER_INIT_TIMEOUT) {
+                cancelled.store(true, Ordering::Release);
+                log::error!("DF {id} | Could not initialize DeepFilter runtime: {error}");
+                true
+            } else {
+                false
+            };
+        let hist = DfControlHistory::default();
+        if !worker_failed {
+            log::info!(
+                "DF {} | Initialized plugin in {:.1}ms",
+                &id,
+                t0.elapsed().as_secs_f32() * 1000.
+            );
+        }
         DfPlugin {
             i_tx,
             o_rx,
@@ -242,14 +300,16 @@ fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
             t_proc_change: 0,
             sleep_duration,
             control_hist: hist,
-            _h: worker_handle,
+            cancelled,
+            worker: Some(worker_handle),
+            worker_failed,
             #[cfg(feature = "dbus")]
-            _dbus: None,
+            dbus: None,
         }
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum DfControl {
     AttenLim,
     PfBeta,
@@ -327,49 +387,88 @@ impl DfControlHistory {
     }
 }
 
+impl DfPlugin {
+    fn worker_finished(&self) -> bool {
+        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    fn fail_worker(&mut self, reason: &str) {
+        if !self.worker_failed {
+            log::error!("DF {} | {reason}; bypassing processing", self.id);
+            self.worker_failed = true;
+        }
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    #[cfg(feature = "dbus")]
+    fn stop_dbus(&mut self) {
+        if let Some((handle, done, cancelled)) = self.dbus.take() {
+            cancelled.store(true, Ordering::Release);
+            done.notify(1);
+            match handle.join() {
+                Ok(_) => log::debug!("{} | dbus thread joined", self.id),
+                Err(error) => log::error!("{} | dbus thread error: {:?}", self.id, error),
+            }
+        }
+    }
+}
+
+impl Drop for DfPlugin {
+    fn drop(&mut self) {
+        #[cfg(feature = "dbus")]
+        self.stop_dbus();
+        self.cancelled.store(true, Ordering::Release);
+        if let Some(handle) = self.worker.take() {
+            if let Err(error) = handle.join() {
+                log::error!("DF {} | Worker thread error: {:?}", self.id, error);
+            }
+        }
+    }
+}
+
 impl Plugin for DfPlugin {
     fn activate(&mut self) {
         log::info!("DF {} | activate", self.id);
         #[cfg(feature = "dbus")]
         {
-            if !test_dbus_name_avail() {
-                return;
-            }
-            let init = Arc::new(Event::new());
             let done = Arc::new(Event::new());
-            let init_listen = init.listen();
-            self._dbus = Some((
-                thread::spawn(get_dbus_worker(
-                    self.control_tx.clone(),
-                    init,
-                    done.clone(),
-                    self.id.clone(),
-                )),
-                done,
-            ));
-            init_listen.wait(); // Wait for dbus server init
-            log::debug!("dbus thread spawned")
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let (worker, ready) = get_dbus_worker(
+                self.control_tx.clone(),
+                Arc::clone(&done),
+                self.id.clone(),
+                Arc::clone(&cancelled),
+            );
+            let handle = thread::spawn(worker);
+            match ready.recv_timeout(DBUS_INIT_TIMEOUT) {
+                Ok(Ok(())) => {
+                    self.dbus = Some((handle, done, cancelled));
+                    log::debug!("dbus thread spawned");
+                }
+                Ok(Err(error)) => {
+                    let _ = handle.join();
+                    log::error!("Failed to init dbus session: {error}");
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    let _ = handle.join();
+                    log::error!("dbus thread terminated during initialization");
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    cancelled.store(true, Ordering::Release);
+                    done.notify(1);
+                    self.dbus = Some((handle, done, cancelled));
+                    log::error!(
+                        "dbus initialization timed out after {:.1}s",
+                        DBUS_INIT_TIMEOUT.as_secs_f32()
+                    );
+                }
+            }
         }
     }
     fn deactivate(&mut self) {
         log::info!("DF {} | deactivate", self.id);
         #[cfg(feature = "dbus")]
-        {
-            if let Some((handle, done)) = self._dbus.take() {
-                done.notify(1);
-                for _ in 0..20 {
-                    sleep(Duration::from_millis(5));
-                    if handle.is_finished() {
-                        match handle.join() {
-                            Ok(_) => log::debug!("{} | dbus thread joined", self.id),
-                            Err(e) => log::error!("{} | dbus thread error: {:?}", self.id, e),
-                        }
-                        break;
-                    }
-                    log::error!("{} | Joining dbus thread timed out.", self.id);
-                }
-            }
-        }
+        self.stop_dbus();
     }
     fn run<'a>(&mut self, sample_count: usize, ports: &[&'a PortConnection<'a>]) {
         let t0 = Instant::now();
@@ -385,6 +484,15 @@ impl Plugin for DfPlugin {
             outputs.push(ports[i].unwrap_audio_mut());
             i += 1;
         }
+        if self.worker_failed || self.worker_finished() {
+            if !self.worker_failed {
+                self.fail_worker("Worker terminated");
+            }
+            for (i_ch, o_ch) in inputs.iter().zip(outputs.iter_mut()) {
+                o_ch.copy_from_slice(i_ch);
+            }
+            return;
+        }
         for p in ports[i..].iter() {
             let &v = p.unwrap_control();
             let c = DfControl::from_port_name(p.port.name);
@@ -396,9 +504,23 @@ impl Plugin for DfPlugin {
                 }
             }
             if v != self.control_hist.get(&c) {
-                self.control_hist.set(&c, v);
-                self.control_tx.send((c, v)).expect("Failed to send control parameter");
+                match self.control_tx.try_send((c, v)) {
+                    Ok(()) => self.control_hist.set(&c, v),
+                    Err(TrySendError::Full(_)) => {
+                        log::debug!("DF {} | Worker control queue full", self.id)
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        self.fail_worker("Worker control channel disconnected");
+                    }
+                }
             }
+        }
+
+        if self.worker_failed {
+            for (i_ch, o_ch) in inputs.iter().zip(outputs.iter_mut()) {
+                o_ch.copy_from_slice(i_ch);
+            }
+            return;
         }
 
         {
@@ -421,6 +543,20 @@ impl Plugin for DfPlugin {
                     }
                     break 'outer;
                 }
+            }
+            if self.worker_finished() {
+                self.fail_worker("Worker terminated");
+                for (i_ch, o_ch) in inputs.iter().zip(outputs.iter_mut()) {
+                    o_ch.copy_from_slice(i_ch);
+                }
+                return;
+            }
+            if t0.elapsed() >= self.sleep_duration * (WORKER_STALL_FRAMES * 5) {
+                self.fail_worker("Worker missed the processing deadline");
+                for (i_ch, o_ch) in inputs.iter().zip(outputs.iter_mut()) {
+                    o_ch.copy_from_slice(i_ch);
+                }
+                return;
             }
             sleep(self.sleep_duration);
         }
@@ -486,7 +622,7 @@ impl Plugin for DfPlugin {
 #[cfg(feature = "dbus")]
 fn build_dbus_session<I>(control: I) -> Result<zbus::blocking::Connection, zbus::Error>
 where
-    I: zbus::Interface,
+    I: Interface,
 {
     ConnectionBuilder::session()?
         .name(DBUS_NAME)?
@@ -494,44 +630,40 @@ where
         .build()
 }
 #[cfg(feature = "dbus")]
-fn test_dbus_name_avail() -> bool {
-    let control = DfDbusControlDummy {};
-    match build_dbus_session(control) {
-        Ok(con) => {
-            con.release_name(DBUS_NAME).expect("Failed to release dbus name");
-            true
-        }
-        Err(e) => {
-            log::error!("Failed to init dbus session {}", e);
-            false
-        }
-    }
-}
-
-#[cfg(feature = "dbus")]
 fn get_dbus_worker(
     tx: ControlProd,
-    init: Arc<Event>,
     done: Arc<Event>,
     id: String,
-) -> impl FnMut() {
-    move || {
+    cancelled: Arc<AtomicBool>,
+) -> (impl FnOnce(), Receiver<Result<(), String>>) {
+    let (ready_tx, ready_rx) = sync_channel(1);
+    let worker = move || {
         log::debug!("{id} | Initializing dbus server");
         let done_listener = done.clone().listen();
         let control = DfDbusControl { tx: tx.clone() };
-        let con = build_dbus_session(control).expect("Failed to init dbus session");
-        init.notify(1); // Notify caller that dbus server has been initialized.
+        let con = match build_dbus_session(control) {
+            Ok(connection) => connection,
+            Err(error) => {
+                let _ = ready_tx.send(Err(error.to_string()));
+                return;
+            }
+        };
+        if cancelled.load(Ordering::Acquire) {
+            let _ = con.release_name(DBUS_NAME);
+            return;
+        }
+        if ready_tx.send(Ok(())).is_err() {
+            let _ = con.release_name(DBUS_NAME);
+            return;
+        }
         done_listener.wait();
-        con.release_name(DBUS_NAME).expect("Failed to release dbus name");
+        if let Err(error) = con.release_name(DBUS_NAME) {
+            log::error!("{id} | Failed to release dbus name: {error}");
+        }
         log::debug!("{id} | Got done notification. Releasing dbus name");
-    }
+    };
+    (worker, ready_rx)
 }
-
-#[cfg(feature = "dbus")]
-struct DfDbusControlDummy {}
-#[cfg(feature = "dbus")]
-#[dbus_interface(name = "org.deepfilter.DeepFilterLadspa")]
-impl DfDbusControlDummy {}
 
 #[cfg(feature = "dbus")]
 struct DfDbusControl {
@@ -539,30 +671,31 @@ struct DfDbusControl {
 }
 
 #[cfg(feature = "dbus")]
-#[dbus_interface(name = "org.deepfilter.DeepFilterLadspa")]
 impl DfDbusControl {
-    fn atten_lim(&self, lim: u32) {
+    fn send(&self, control: DfControl, value: f32) -> zbus::fdo::Result<()> {
         self.tx
-            .send((DfControl::AttenLim, lim as f32))
-            .expect("Failed to send DfControl");
+            .try_send((control, value))
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
-    fn pf_beta(&self, beta: f32) {
-        self.tx.send((DfControl::PfBeta, beta)).expect("Failed to send DfControl");
+}
+
+#[cfg(feature = "dbus")]
+#[interface(name = "org.deepfilter.DeepFilterLadspa")]
+impl DfDbusControl {
+    fn atten_lim(&self, lim: u32) -> zbus::fdo::Result<()> {
+        self.send(DfControl::AttenLim, lim as f32)
     }
-    fn min_processing_thresh(&self, thresh: i32) {
-        self.tx
-            .send((DfControl::MinThreshDb, thresh as f32))
-            .expect("Failed to send DfControl")
+    fn pf_beta(&self, beta: f32) -> zbus::fdo::Result<()> {
+        self.send(DfControl::PfBeta, beta)
     }
-    fn max_erb_thresh(&self, thresh: i32) {
-        self.tx
-            .send((DfControl::MaxErbThreshDb, thresh as f32))
-            .expect("Failed to send DfControl")
+    fn min_processing_thresh(&self, thresh: i32) -> zbus::fdo::Result<()> {
+        self.send(DfControl::MinThreshDb, thresh as f32)
     }
-    fn max_df_thresh(&self, thresh: i32) {
-        self.tx
-            .send((DfControl::MaxDfThreshDb, thresh as f32))
-            .expect("Failed to send DfControl")
+    fn max_erb_thresh(&self, thresh: i32) -> zbus::fdo::Result<()> {
+        self.send(DfControl::MaxErbThreshDb, thresh as f32)
+    }
+    fn max_df_thresh(&self, thresh: i32) -> zbus::fdo::Result<()> {
+        self.send(DfControl::MaxDfThreshDb, thresh as f32)
     }
 }
 
@@ -718,5 +851,46 @@ pub fn get_ladspa_descriptor(index: u64) -> Option<PluginDescriptor> {
             new: |d, sr| Box::new(get_new_df(2)(d, sr)),
         }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_readiness_reports_success() {
+        let (tx, rx) = sync_channel(1);
+        tx.send(Ok(())).unwrap();
+
+        assert_eq!(wait_for_worker_ready(&rx, Duration::from_secs(1)), Ok(()));
+    }
+
+    #[test]
+    fn worker_readiness_reports_initialization_error() {
+        let (tx, rx) = sync_channel(1);
+        tx.send(Err("invalid model".to_string())).unwrap();
+
+        assert_eq!(
+            wait_for_worker_ready(&rx, Duration::from_secs(1)),
+            Err("invalid model".to_string())
+        );
+    }
+
+    #[test]
+    fn worker_readiness_reports_early_termination() {
+        let (tx, rx) = sync_channel::<Result<(), String>>(1);
+        drop(tx);
+
+        let error = wait_for_worker_ready(&rx, Duration::from_secs(1)).unwrap_err();
+        assert!(error.contains("worker terminated before initialization completed"));
+    }
+
+    #[test]
+    fn worker_readiness_times_out() {
+        let (_tx, rx) = sync_channel::<Result<(), String>>(1);
+
+        let error = wait_for_worker_ready(&rx, Duration::from_millis(1)).unwrap_err();
+        assert!(error.contains("initialization timed out"));
     }
 }

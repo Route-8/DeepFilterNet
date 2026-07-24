@@ -15,6 +15,7 @@ pub fn init_panic_hook() {
 #[wasm_bindgen]
 pub struct DFState {
     inner: crate::tract::DfTract,
+    input_buf: Array2<f32>,
     output_buf: Array2<f32>,
 }
 
@@ -30,6 +31,7 @@ impl DFState {
         let hop_size = m.hop_size;
         DFState {
             inner: m,
+            input_buf: Array2::zeros((1, hop_size)),
             output_buf: Array2::zeros((1, hop_size)),
         }
     }
@@ -54,6 +56,17 @@ pub unsafe fn df_create(
 ) -> *mut DFState {
     let df = DFState::new(model_bytes, 1, atten_lim);
     Box::into_raw(df.boxed())
+}
+
+/// Destroy a DeepFilterNet state created by [`df_create`].
+///
+/// Persistent input/output pointers and their typed-array views become invalid
+/// immediately. Passing the same non-null pointer more than once is invalid.
+#[wasm_bindgen]
+pub unsafe fn df_destroy(st: *mut DFState) {
+    if !st.is_null() {
+        drop(unsafe { Box::from_raw(st) });
+    }
 }
 
 /// Get DeepFilterNet frame size in samples.
@@ -99,4 +112,55 @@ pub unsafe fn df_process_frame(st: *mut DFState, input: &[f32]) -> js_sys::Float
     let output_view = state.output_buf.view_mut();
     let _lsnr = state.inner.process(input, output_view).expect("Failed to process DF frame");
     js_sys::Float32Array::from(state.output_buf.as_slice().unwrap())
+}
+
+/// Stable byte offset of the persistent input frame in WASM linear memory.
+/// The caller must recreate its typed-array view if WASM memory grows and must
+/// not use it after calling [`df_destroy`].
+#[wasm_bindgen]
+pub unsafe fn df_input_frame_ptr(st: *mut DFState) -> u32 {
+    let state = st.as_ref().expect("Invalid pointer");
+    state.input_buf.as_ptr() as usize as u32
+}
+
+/// Stable byte offset of the persistent output frame in WASM linear memory.
+/// The caller must recreate its typed-array view if WASM memory grows and must
+/// not use it after calling [`df_destroy`].
+#[wasm_bindgen]
+pub unsafe fn df_output_frame_ptr(st: *mut DFState) -> u32 {
+    let state = st.as_ref().expect("Invalid pointer");
+    state.output_buf.as_ptr() as usize as u32
+}
+
+/// Process the persistent input frame into the persistent output frame without
+/// allocating or copying a JavaScript typed array.
+#[wasm_bindgen]
+pub unsafe fn df_process_frame_persistent(st: *mut DFState) -> f32 {
+    let state = st.as_mut().expect("Invalid pointer");
+    state
+        .inner
+        .process(state.input_buf.view(), state.output_buf.view_mut())
+        .expect("Failed to process DF frame")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_frame_buffers_remain_stable() {
+        let model = include_bytes!("../../models/DeepFilterNet3_onnx.tar.gz");
+        let state_ptr = Box::into_raw(Box::new(DFState::new(model, 1, 100.0)));
+        let input_ptr = unsafe { df_input_frame_ptr(state_ptr) };
+        let output_ptr = unsafe { df_output_frame_ptr(state_ptr) };
+        unsafe { (*state_ptr).input_buf.fill(0.01) };
+
+        let lsnr = unsafe { df_process_frame_persistent(state_ptr) };
+
+        assert!(lsnr.is_finite());
+        assert_eq!(unsafe { df_input_frame_ptr(state_ptr) }, input_ptr);
+        assert_eq!(unsafe { df_output_frame_ptr(state_ptr) }, output_ptr);
+        assert!(unsafe { &*state_ptr }.output_buf.iter().all(|sample| sample.is_finite()));
+        unsafe { df_destroy(state_ptr) };
+    }
 }

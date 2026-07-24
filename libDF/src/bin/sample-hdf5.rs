@@ -4,7 +4,7 @@ use std::process::exit;
 use anyhow::Result;
 use df::dataset::Hdf5Dataset;
 use df::wav_utils::write_wav_arr2;
-use rand::seq::SliceRandom;
+use rand::prelude::IndexedRandom;
 
 fn main() -> Result<()> {
     let args = args().collect::<Vec<String>>();
@@ -18,7 +18,7 @@ fn main() -> Result<()> {
     let ds = Hdf5Dataset::new(p)?;
     let k = match args.get(2) {
         Some(k) => k.to_string(),
-        None => ds.keys()?.choose(&mut rand::thread_rng()).unwrap().to_string(),
+        None => ds.keys()?.choose(&mut rand::rng()).unwrap().to_string(),
     };
     let data = ds.read(&k).unwrap();
     let out_dir = args.get(3).cloned().unwrap_or_else(|| "out".to_owned());
