@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::Instant;
@@ -25,7 +26,7 @@ fn libdfdata(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pyclass]
 struct _FdDataLoader {
     loader: Mutex<DataLoader>,
-    finished: bool,
+    finished: AtomicBool,
     logger: Receiver<LogMessage>,
 }
 
@@ -220,22 +221,25 @@ impl _FdDataLoader {
         let loader = dl_builder.build().to_py_err()?;
         Ok(_FdDataLoader {
             loader: Mutex::new(loader),
-            finished: false,
+            finished: AtomicBool::new(false),
             logger: log_receiver,
         })
     }
 
-    fn start_epoch(&mut self, split: &str, seed: usize) -> PyResult<()> {
-        self.finished = false;
+    fn start_epoch(&self, split: &str, seed: usize) -> PyResult<()> {
+        self.finished.store(false, Ordering::SeqCst);
         match self.lock_loader()?.start_epoch(split, seed) {
             Err(e) => Err(PyValueError::new_err(e.to_string())),
             Ok(()) => Ok(()),
         }
     }
 
-    fn get_batch<'py>(&'py mut self, py: Python<'py>) -> PyResult<FdBatch<'py>> {
+    // All methods take `&self`: `get_batch` releases the GIL via `py.detach` while it waits
+    // for a batch, and an exclusive pyclass borrow held across that wait would make any
+    // concurrent method call from another Python thread fail with "Already borrowed".
+    fn get_batch<'py>(&'py self, py: Python<'py>) -> PyResult<FdBatch<'py>> {
         let t0 = Instant::now();
-        if self.finished {
+        if self.finished.load(Ordering::SeqCst) {
             return Err(PyStopIteration::new_err("Epoch finished"));
         }
         let batch = py.detach(|| self.lock_loader()?.get_batch::<Complex32>().to_py_err())?;
@@ -257,13 +261,13 @@ impl _FdDataLoader {
                 ))
             }
             None => {
-                self.finished = true;
+                self.finished.store(true, Ordering::SeqCst);
                 Err(PyStopIteration::new_err("Epoch finished"))
             }
         }
     }
 
-    fn cleanup(&mut self, py: Python<'_>) -> PyResult<()> {
+    fn cleanup(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| self.lock_loader()?.join_fill_thread().to_py_err())
     }
 
@@ -275,7 +279,7 @@ impl _FdDataLoader {
         Ok(self.lock_loader()?.dataset_len(split))
     }
 
-    fn set_batch_size(&mut self, batch_size: usize, split: &str) -> PyResult<()> {
+    fn set_batch_size(&self, batch_size: usize, split: &str) -> PyResult<()> {
         self.lock_loader()?.set_batch_size(batch_size, split);
         Ok(())
     }
@@ -284,7 +288,7 @@ impl _FdDataLoader {
         Ok(self.lock_loader()?.batch_size(split))
     }
 
-    fn get_log_messages(&mut self) -> Vec<(String, String, Option<String>, Option<u32>)> {
+    fn get_log_messages(&self) -> Vec<(String, String, Option<String>, Option<u32>)> {
         let mut messages = Vec::new();
         loop {
             match self.logger.try_recv() {

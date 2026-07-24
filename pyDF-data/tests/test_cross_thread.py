@@ -6,11 +6,11 @@ from shutil import copyfile
 from libdfdata import _FdDataLoader
 
 
-def test_get_batch_from_pin_memory_worker_thread(tmp_path):
+def _make_loader(tmp_path):
     assets = Path(__file__).parents[2] / "assets"
     config = tmp_path / "dataset.cfg"
     copyfile(assets / "dataset.cfg", config)
-    loader = _FdDataLoader(
+    return _FdDataLoader(
         str(assets),
         str(config),
         48_000,
@@ -39,6 +39,10 @@ def test_get_batch_from_pin_memory_worker_thread(tmp_path):
         gains=None,
         log_level=None,
     )
+
+
+def test_get_batch_from_pin_memory_worker_thread(tmp_path):
+    loader = _make_loader(tmp_path)
     loader.start_epoch("train", 0)
 
     result = []
@@ -66,5 +70,44 @@ def test_get_batch_from_pin_memory_worker_thread(tmp_path):
         assert len(result) == 1
         assert len(result[0]) == 10
         assert result[0][0].shape[0] == 1
+    finally:
+        loader.cleanup()
+
+
+def test_concurrent_metadata_access_no_borrow_error(tmp_path):
+    """Calling other loader methods while another thread sits inside get_batch must not
+    raise "Already borrowed" (pyo3 borrow of the pyclass held across the detached wait)."""
+    loader = _make_loader(tmp_path)
+    loader.start_epoch("train", 0)
+
+    result = []
+    batch_errors = []
+    meta_errors = []
+
+    def get_batch():
+        try:
+            result.append(loader.get_batch())
+        except BaseException as error:
+            batch_errors.append(error)
+
+    worker = threading.Thread(target=get_batch, name="BatchLoop")
+    worker.start()
+    deadline = time.monotonic() + 30
+    while worker.is_alive() and time.monotonic() < deadline:
+        try:
+            loader.get_log_messages()
+            loader.dataloader_len("train")
+            loader.batch_size("train")
+        except BaseException as error:
+            meta_errors.append(error)
+            break
+        time.sleep(0.001)
+    worker.join(timeout=30)
+
+    try:
+        assert not meta_errors, f"concurrent metadata call failed: {meta_errors!r}"
+        assert not worker.is_alive(), "get_batch timed out"
+        assert not batch_errors
+        assert len(result) == 1
     finally:
         loader.cleanup()

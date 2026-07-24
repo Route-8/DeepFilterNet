@@ -65,6 +65,9 @@ struct DfPlugin {
     cancelled: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     worker_failed: bool,
+    /// Output samples that belong to a bypassed `run()` call and must be discarded on arrival.
+    pending_drop: usize,
+    consecutive_stalls: u32,
     #[cfg(feature = "dbus")]
     dbus: Option<(JoinHandle<()>, Arc<Event>, Arc<AtomicBool>)>,
 }
@@ -73,8 +76,16 @@ const ID_MONO: u64 = 7843795;
 const ID_STEREO: u64 = 7843796;
 const WORKER_INIT_TIMEOUT: Duration = Duration::from_secs(60);
 const WORKER_STALL_FRAMES: u32 = 10;
+const WORKER_STALL_MAX_CONSECUTIVE: u32 = 20;
 #[cfg(feature = "dbus")]
 const DBUS_INIT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(feature = "dbus")]
+const DBUS_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
+// Only the raw model bytes are cached; every worker still pays the full tract compile in
+// `DfTract::new`. A compiled-model cache is not possible without libDF changes: the tract
+// session state inside `DfTract` is `!Send` (`Rc`-based tensors), so it cannot be shared or
+// even moved across worker threads. Caching the `Send + Sync` runnable plans before
+// `spawn()` would require a new `DfTract` constructor in `libDF/src/tract.rs`.
 static DF_PARAMS: OnceLock<DfParams> = OnceLock::new();
 
 fn log_format(buf: &mut env_logger::fmt::Formatter, record: &log::Record) -> io::Result<()> {
@@ -208,6 +219,25 @@ fn init_df_params() -> (DfParams, usize, usize) {
     (df_params, sr, frame_size)
 }
 
+/// Deadline for one `run()` call: a grace of `WORKER_STALL_FRAMES` hop periods plus one hop
+/// period per frame the host block actually needs, so large host buffers get proportionally
+/// more time.
+fn stall_deadline(sleep_duration: Duration, frame_size: usize, sample_count: usize) -> Duration {
+    let needed_frames = sample_count.div_ceil(frame_size).max(1) as u32;
+    sleep_duration * 5 * (WORKER_STALL_FRAMES + needed_frames)
+}
+
+/// Remove this call's `sample_count` samples from the back of the input queues again. Returns
+/// the number of samples per channel the worker had already consumed; their output will still
+/// surface in the output queue and must be discarded by the caller.
+fn rollback_enqueued(i_q: &mut [VecDeque<f32>], sample_count: usize) -> usize {
+    let remove = sample_count.min(i_q.first().map_or(0, VecDeque::len));
+    for i_q_ch in i_q.iter_mut() {
+        i_q_ch.truncate(i_q_ch.len().saturating_sub(remove));
+    }
+    sample_count - remove
+}
+
 fn wait_for_worker_ready(
     ready: &Receiver<Result<(), String>>,
     timeout: Duration,
@@ -303,6 +333,8 @@ fn get_new_df(channels: usize) -> impl Fn(&PluginDescriptor, u64) -> DfPlugin {
             cancelled,
             worker: Some(worker_handle),
             worker_failed,
+            pending_drop: 0,
+            consecutive_stalls: 0,
             #[cfg(feature = "dbus")]
             dbus: None,
         }
@@ -405,9 +437,23 @@ impl DfPlugin {
         if let Some((handle, done, cancelled)) = self.dbus.take() {
             cancelled.store(true, Ordering::Release);
             done.notify(1);
-            match handle.join() {
-                Ok(_) => log::debug!("{} | dbus thread joined", self.id),
-                Err(error) => log::error!("{} | dbus thread error: {:?}", self.id, error),
+            // The thread may be stuck inside the blocking zbus connection builder (e.g. on a
+            // hung session bus), which cannot be interrupted. Join with a timeout and detach
+            // the thread if it does not finish: leaking it beats freezing the host on unload.
+            let deadline = Instant::now() + DBUS_JOIN_TIMEOUT;
+            while !handle.is_finished() && Instant::now() < deadline {
+                sleep(Duration::from_millis(5));
+            }
+            if handle.is_finished() {
+                match handle.join() {
+                    Ok(_) => log::debug!("{} | dbus thread joined", self.id),
+                    Err(error) => log::error!("{} | dbus thread error: {:?}", self.id, error),
+                }
+            } else {
+                log::warn!(
+                    "{} | dbus thread did not stop in time; detaching it",
+                    self.id
+                );
             }
         }
     }
@@ -418,6 +464,8 @@ impl Drop for DfPlugin {
         #[cfg(feature = "dbus")]
         self.stop_dbus();
         self.cancelled.store(true, Ordering::Release);
+        // The worker checks `cancelled` on every loop iteration, so this join returns promptly
+        // unless the worker is wedged inside `df.process`.
         if let Some(handle) = self.worker.take() {
             if let Err(error) = handle.join() {
                 log::error!("DF {} | Worker thread error: {:?}", self.id, error);
@@ -532,9 +580,20 @@ impl Plugin for DfPlugin {
             }
         }
 
+        let deadline = stall_deadline(self.sleep_duration, self.frame_size, sample_count);
         'outer: loop {
             {
                 let o_q = &mut self.o_rx.lock().unwrap();
+                // Discard output that belongs to previously bypassed calls.
+                if self.pending_drop > 0 {
+                    let drop_now = self.pending_drop.min(o_q[0].len());
+                    for o_q_ch in o_q.iter_mut() {
+                        for _ in 0..drop_now {
+                            o_q_ch.pop_front();
+                        }
+                    }
+                    self.pending_drop -= drop_now;
+                }
                 if o_q[0].len() >= sample_count {
                     for (o_q_ch, o_ch) in o_q.iter_mut().zip(outputs.iter_mut()) {
                         for o in o_ch.iter_mut() {
@@ -551,8 +610,42 @@ impl Plugin for DfPlugin {
                 }
                 return;
             }
-            if t0.elapsed() >= self.sleep_duration * (WORKER_STALL_FRAMES * 5) {
-                self.fail_worker("Worker missed the processing deadline");
+            if t0.elapsed() >= deadline {
+                // A missed deadline is treated as transient: bypass only this call and let
+                // the worker catch up. Only persistent stalling disables processing.
+                self.consecutive_stalls += 1;
+                if self.consecutive_stalls >= WORKER_STALL_MAX_CONSECUTIVE {
+                    self.fail_worker("Worker persistently missed the processing deadline");
+                } else {
+                    log::warn!(
+                        "DF {} | Worker missed the processing deadline ({}/{}); bypassing this block",
+                        self.id,
+                        self.consecutive_stalls,
+                        WORKER_STALL_MAX_CONSECUTIVE
+                    );
+                    // Take this call's input back out of the pipeline; whatever the worker
+                    // already consumed will surface as output later and is dropped then.
+                    let consumed = {
+                        let i_q = &mut self.i_tx.lock().unwrap();
+                        rollback_enqueued(i_q, sample_count)
+                    };
+                    self.pending_drop += consumed;
+                    // Grow the processing headroom like the underrun path below.
+                    if self.proc_delay < self.sr {
+                        self.proc_delay += self.frame_size;
+                        self.t_proc_change = 0;
+                        log::info!(
+                            "DF {} | Increasing processing latency to {:.1}ms",
+                            self.id,
+                            self.proc_delay as f32 * 1000. / self.sr as f32
+                        );
+                        for o_ch in self.o_rx.lock().unwrap().iter_mut() {
+                            for _ in 0..self.frame_size {
+                                o_ch.push_back(0f32)
+                            }
+                        }
+                    }
+                }
                 for (i_ch, o_ch) in inputs.iter().zip(outputs.iter_mut()) {
                     o_ch.copy_from_slice(i_ch);
                 }
@@ -560,6 +653,7 @@ impl Plugin for DfPlugin {
             }
             sleep(self.sleep_duration);
         }
+        self.consecutive_stalls = 0;
 
         let td = t0.elapsed();
         let t_audio = sample_count as f32 / self.sr as f32;
@@ -599,8 +693,10 @@ impl Plugin for DfPlugin {
                 if o_q[0].len() < self.frame_size {
                     false
                 } else {
-                    for o_q_ch in o_q.iter_mut().take(self.frame_size) {
-                        o_q_ch.pop_front().unwrap();
+                    for o_q_ch in o_q.iter_mut() {
+                        for _ in 0..self.frame_size {
+                            o_q_ch.pop_front().unwrap();
+                        }
                     }
                     true
                 }
@@ -892,5 +988,62 @@ mod tests {
 
         let error = wait_for_worker_ready(&rx, Duration::from_millis(1)).unwrap_err();
         assert!(error.contains("initialization timed out"));
+    }
+
+    #[test]
+    fn stall_deadline_scales_with_sample_count() {
+        let hop = 480;
+        let sleep_duration = Duration::from_secs_f32(hop as f32 / 48000. / 5.);
+        let grace = sleep_duration * 5 * WORKER_STALL_FRAMES;
+
+        let small = stall_deadline(sleep_duration, hop, hop);
+        let large = stall_deadline(sleep_duration, hop, 17 * hop);
+        assert!(small >= grace);
+        assert!(large > small);
+        // One extra hop period per frame the host block needs.
+        assert_eq!(large - small, sleep_duration * 5 * 16);
+        // Degenerate sample counts still get the full grace plus one frame.
+        assert_eq!(stall_deadline(sleep_duration, hop, 0), small);
+    }
+
+    #[test]
+    fn bypass_bookkeeping_preserves_alignment() {
+        let channels = 2;
+        let sample_count = 100;
+        // Simulate: queue held 30 leftover samples, run() pushed 100, worker consumed 60.
+        let mut i_q = vec![VecDeque::new(); channels];
+        for i_q_ch in i_q.iter_mut() {
+            for i in 0..130 - 60 {
+                i_q_ch.push_back(i as f32);
+            }
+        }
+        let consumed = rollback_enqueued(&mut i_q, sample_count);
+        // 70 samples left in the queue -> all of them removed, 30 already consumed.
+        assert_eq!(consumed, 30);
+        for i_q_ch in i_q.iter() {
+            assert!(i_q_ch.is_empty());
+        }
+
+        // Nothing consumed yet: the full block is rolled back and nothing is pending.
+        let mut i_q = vec![VecDeque::new(); channels];
+        for i_q_ch in i_q.iter_mut() {
+            for i in 0..130 {
+                i_q_ch.push_back(i as f32);
+            }
+        }
+        let consumed = rollback_enqueued(&mut i_q, sample_count);
+        assert_eq!(consumed, 0);
+        for i_q_ch in i_q.iter() {
+            assert_eq!(i_q_ch.len(), 30);
+            // The remaining samples are the oldest ones (front of the queue).
+            assert_eq!(*i_q_ch.front().unwrap(), 0.);
+            assert_eq!(*i_q_ch.back().unwrap(), 29.);
+        }
+
+        // Invariant across both cases: samples removed from the pipeline (70 and 100) plus
+        // samples pending drop (30 and 0) equal exactly one host block, keeping the stream
+        // aligned.
+        assert_eq!(70 + 30, sample_count);
+        assert_eq!(100, sample_count);
     }
 }

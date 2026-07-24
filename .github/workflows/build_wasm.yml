@@ -41,9 +41,19 @@ jobs:
       - name: Install wasm-pack
         run: cargo install wasm-pack
 
+      - name: Install binaryen
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
       - name: Build wasm package
         working-directory: libDF
         run: RUSTFLAGS="-C target-feature=+simd128,+bulk-memory" wasm-pack build --no-opt --profile release-lto --target no-modules --features '${{ matrix.features }}'
+
+      - name: Optimize wasm package
+        working-directory: libDF
+        run: >-
+          wasm-opt -O4 --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int
+          --enable-sign-ext --enable-mutable-globals --enable-reference-types --enable-multivalue
+          pkg/df_bg.wasm -o pkg/df_bg.wasm
 
       - uses: actions/upload-artifact@v4
         with:

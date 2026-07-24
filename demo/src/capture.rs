@@ -322,7 +322,8 @@ fn get_worker_fn(
     sample_rates: (usize, usize),
     controls: AtomicControls,
     df_com: Option<GuiCom>,
-) -> impl FnOnce() {
+) -> (impl FnOnce(), Receiver<std::result::Result<(), String>>) {
+    let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
     let (input_sr, output_sr) = sample_rates;
     let (has_init, should_stop) = controls.into_inner();
     let (mut s_lsnr, mut s_spec, mut r_opt) = if let Some(df_com) = df_com {
@@ -330,16 +331,26 @@ fn get_worker_fn(
     } else {
         (None, None, None)
     };
-    move || {
+    let worker = move || {
         let r_params = RuntimeParams::default_with_ch(channels);
-        let mut df =
-            DfTract::new(df_params, &r_params).expect("Could not initialize DeepFilter runtime");
+        let mut df = match DfTract::new(df_params, &r_params) {
+            Ok(df) => df,
+            Err(error) => {
+                let _ = ready_tx.send(Err(format!(
+                    "Could not initialize DeepFilter runtime: {error}"
+                )));
+                return;
+            }
+        };
         debug_assert_eq!(df.ch, 1); // Processing for more channels are not implemented yet
         let mut inframe = Array2::zeros((df.ch, df.hop_size));
         let mut outframe = inframe.clone();
-        df.process(inframe.view(), outframe.view_mut())
-            .expect("Failed to run DeepFilterNet");
+        if let Err(error) = df.process(inframe.view(), outframe.view_mut()) {
+            let _ = ready_tx.send(Err(format!("Failed to run DeepFilterNet: {error}")));
+            return;
+        }
         has_init.store(true, Ordering::Relaxed);
+        let _ = ready_tx.send(Ok(()));
         log::info!("Worker init");
         let mut input_resampler = if input_sr != df.sr {
             let r = Fft::<f32>::new(input_sr, df.sr, df.hop_size, 1, 1, FixedSync::Output)
@@ -421,7 +432,8 @@ fn get_worker_fn(
                 }
             }
         }
-    }
+    };
+    (worker, ready_rx)
 }
 
 fn push_spec(spec: ArrayView2<Complex32>, sender: &SendSpec) {
@@ -490,7 +502,7 @@ impl DeepFilterCapture {
             s_spec,
             r_opt,
         };
-        let worker_handle = Some(thread::spawn(get_worker_fn(
+        let (worker, ready_rx) = get_worker_fn(
             in_cons,
             out_prod,
             df_params,
@@ -498,9 +510,18 @@ impl DeepFilterCapture {
             (source.sr() as usize, sink.sr() as usize),
             controls,
             Some(df_com),
-        )));
-        while !has_init.load(Ordering::Relaxed) {
-            sleep(Duration::from_secs_f32(0.01));
+        );
+        let worker_handle = Some(thread::spawn(worker));
+        match ready_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(Ok(())) => (),
+            Ok(Err(error)) => {
+                should_stop.store(true, Ordering::Relaxed);
+                anyhow::bail!("DeepFilter worker failed to initialize: {error}");
+            }
+            Err(_) => {
+                should_stop.store(true, Ordering::Relaxed);
+                anyhow::bail!("DeepFilter worker terminated or timed out during initialization");
+            }
         }
         log::info!("DeepFilter Capture init");
         source.start(in_prod)?;
@@ -523,7 +544,9 @@ impl DeepFilterCapture {
         if let Some(h) = self.worker_handle.take() {
             log::info!("Joining DF Worker");
             self.should_stop.swap(true, Ordering::Relaxed);
-            h.join().expect("Error during DF worker join");
+            if let Err(error) = h.join() {
+                log::error!("DF worker thread panicked: {error:?}");
+            }
         }
         Ok(())
     }

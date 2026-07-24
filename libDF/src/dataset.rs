@@ -1720,10 +1720,14 @@ impl Hdf5Dataset {
     }
     fn convert_hdf5_array(arr: ndarray_015::ArrayD<f32>) -> Result<ArrayD<f32>> {
         let shape = arr.shape().to_vec();
-        Ok(ArrayD::from_shape_vec(
-            IxDyn(&shape),
-            arr.iter().copied().collect(),
-        )?)
+        // hdf5 builds its arrays from a freshly read contiguous buffer, so the raw vec can be
+        // moved into the ndarray 0.17 array without copying.
+        let data = if arr.is_standard_layout() {
+            arr.into_raw_vec()
+        } else {
+            arr.iter().copied().collect()
+        };
+        Ok(ArrayD::from_shape_vec(IxDyn(&shape), data)?)
     }
     /// Read a PCM encoded sample from an `hdf5::Dataset`.
     ///

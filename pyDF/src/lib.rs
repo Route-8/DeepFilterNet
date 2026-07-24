@@ -6,7 +6,7 @@ use df::{Complex32, DFState, UNIT_NORM_INIT};
 use ndarray::{Array1, Array2, Array3, Array4, ArrayD, ArrayView4, Axis, ShapeError};
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayDyn, PyReadonlyArray1, PyReadonlyArray2,
-    PyReadonlyArray3, PyReadonlyArrayDyn, PyUntypedArrayMethods,
+    PyReadonlyArray3, PyReadonlyArrayDyn, PyReadwriteArray3, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -75,7 +75,7 @@ impl DF {
     fn synthesis<'py>(
         &mut self,
         py: Python<'py>,
-        input: PyReadonlyArray3<Complex32>,
+        mut input: PyReadwriteArray3<Complex32>,
         reset: Option<bool>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let frame_size = self.state.frame_size;
@@ -85,7 +85,7 @@ impl DF {
         let out_steps = freq_steps * frame_size;
         let mut output = Array2::<f32>::zeros((channels, out_steps));
 
-        let mut input = input.as_array().to_owned();
+        let mut input = input.as_array_mut();
         for (mut in_ch, mut out_ch) in
             input.axis_iter_mut(Axis(0)).zip(output.axis_iter_mut(Axis(0)))
         {
@@ -259,24 +259,19 @@ fn erb_inv<'py>(
 #[pyfunction]
 fn erb_norm<'py>(
     py: Python<'py>,
-    erb: PyReadonlyArray3<f32>,
+    mut erb: PyReadwriteArray3<f32>,
     alpha: f32,
     state: Option<PyReadonlyArray2<f32>>,
 ) -> PyResult<Bound<'py, PyArray3<f32>>> {
     // Input shape [C, T, F]
     // State shape [C, F]
-    let mut erb = erb.as_array().to_owned();
+    let mut erb = erb.as_array_mut();
     if let Some(state) = state {
-        transforms::erb_norm(
-            &mut erb.view_mut(),
-            Some(state.as_array().to_owned()),
-            alpha,
-        )
-        .to_py_err()?;
+        transforms::erb_norm(&mut erb, Some(state.as_array().to_owned()), alpha).to_py_err()?;
     } else {
-        transforms::erb_norm(&mut erb.view_mut(), None, alpha).to_py_err()?;
+        transforms::erb_norm(&mut erb, None, alpha).to_py_err()?;
     };
-    Ok(erb.into_owned().into_pyarray(py))
+    Ok(erb.to_owned().into_pyarray(py))
 }
 
 #[pyfunction]

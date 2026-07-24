@@ -1,5 +1,9 @@
 use ndarray::{prelude::*, Slice};
-use rubato::{audioadapter_buffers::direct::SequentialSliceOfVecs, Fft, FixedSync, Resampler};
+use rubato::{
+    audioadapter::Adapter,
+    audioadapter_buffers::direct::{SequentialSliceOfSlices, SequentialSliceOfVecs},
+    Fft, FixedSync, Indexing, Resampler,
+};
 use thiserror::Error;
 
 use crate::*;
@@ -382,19 +386,79 @@ pub fn resample(
     let chunk_size = chunk_size.unwrap_or(2048);
     let mut resampler = Fft::<f32>::new(sr, new_sr, chunk_size, 1, channels, FixedSync::Both)
         .expect("Could not initialize resampler");
-    let input_data = x.outer_iter().map(|ch| ch.to_vec()).collect::<Vec<_>>();
-    let input = SequentialSliceOfVecs::new(&input_data, channels, len).unwrap();
+    let delay = resampler.output_delay();
+    let expected_output_len = (resampler.resample_ratio() * len as f64).ceil() as usize;
     let output_capacity = resampler.process_all_needed_output_len(len);
-    let mut output_data = vec![vec![0.; output_capacity]; channels];
+
+    let borrowed: Option<Vec<&[f32]>> = x.outer_iter().map(|ch| ch.to_slice()).collect();
+    let owned: Vec<Vec<f32>>;
+    let slices_adapter;
+    let vecs_adapter;
+    let input: &dyn Adapter<f32> = match &borrowed {
+        Some(slices) => {
+            slices_adapter =
+                SequentialSliceOfSlices::new(slices.as_slice(), channels, len).unwrap();
+            &slices_adapter
+        }
+        None => {
+            owned = x.outer_iter().map(|ch| ch.to_vec()).collect();
+            vecs_adapter = SequentialSliceOfVecs::new(&owned, channels, len).unwrap();
+            &vecs_adapter
+        }
+    };
+
+    let mut output_data = vec![vec![0f32; output_capacity]; channels];
     let mut output =
         SequentialSliceOfVecs::new_mut(&mut output_data, channels, output_capacity).unwrap();
-    let (_, output_len) = resampler.process_all_into_buffer(&input, &mut output, len, None)?;
 
-    let mut out = Array2::zeros((channels, output_len));
-    for (mut out_ch, data_ch) in out.outer_iter_mut().zip(output_data.iter()) {
-        out_ch.assign(&ArrayView1::from(&data_ch[..output_len]));
+    // rubato's `process_all_into_buffer` only trims the resampler delay inside its main loop,
+    // which never runs when the whole input fits into a single chunk: short inputs come back
+    // delay-shifted with the tail missing. Drive `process_into_buffer` manually so that
+    // `delay + expected_output_len` frames are generated for every input length, then cut the
+    // delay off the front.
+    let mut indexing = Indexing {
+        input_offset: 0,
+        output_offset: 0,
+        partial_len: None,
+        active_channels_mask: None,
+    };
+    let mut frames_left = len;
+    let mut total_out = 0;
+    while frames_left > resampler.input_frames_next() {
+        let (n_in, n_out) = resampler.process_into_buffer(input, &mut output, Some(&indexing))?;
+        frames_left -= n_in;
+        indexing.input_offset += n_in;
+        total_out += n_out;
+        indexing.output_offset = total_out;
     }
-    Ok(out)
+    if frames_left > 0 {
+        indexing.partial_len = Some(frames_left);
+        let (_, n_out) = resampler.process_into_buffer(input, &mut output, Some(&indexing))?;
+        total_out += n_out;
+        indexing.output_offset = total_out;
+    }
+    indexing.partial_len = Some(0);
+    while total_out < delay + expected_output_len {
+        let (_, n_out) = resampler.process_into_buffer(input, &mut output, Some(&indexing))?;
+        total_out += n_out;
+        indexing.output_offset = total_out;
+    }
+
+    if channels == 1 {
+        let mut data = output_data.pop().unwrap();
+        data.drain(..delay);
+        data.truncate(expected_output_len);
+        Ok(Array2::from_shape_vec((1, expected_output_len), data)?)
+    } else {
+        let mut flat = Vec::with_capacity(channels * expected_output_len);
+        for ch in output_data.iter() {
+            flat.extend_from_slice(&ch[delay..delay + expected_output_len]);
+        }
+        Ok(Array2::from_shape_vec(
+            (channels, expected_output_len),
+            flat,
+        )?)
+    }
 }
 
 /// Bandwidth extension via spectral translation.
@@ -668,6 +732,148 @@ mod tests {
         x[0][5] = -10f32;
         let max = find_max_abs(x.iter().flatten()).expect("NaN");
         assert_eq!(max, 10.);
+        Ok(())
+    }
+
+    /// For long inputs the manual `process_into_buffer` loop must reproduce rubato's
+    /// `process_all_into_buffer` bit-exactly — except at index `output_delay()`, where
+    /// rubato 3.0.0's delay-trim (`copy_frames_within(trim, 0, trim)`) relocates one frame
+    /// too few when `fft_size_out` is odd, duplicating one sample and dropping another.
+    /// The manual loop places every generated frame; only that single misplaced sample may
+    /// differ per channel.
+    #[test]
+    fn test_resample_long_matches_process_all_into_buffer() -> Result<()> {
+        let (sample, sr) = setup();
+        let channels = sample.len_of(Axis(0));
+        let len = sample.len_of(Axis(1));
+        for &chunk_size in &[512usize, 2048] {
+            for &new_sr in &[16000usize, 44100] {
+                let out = resample(sample.view(), sr, new_sr, Some(chunk_size))?;
+                // Reference: rubato's own high-level API, correct for long inputs apart from
+                // the single misplaced frame described above.
+                let mut resampler =
+                    Fft::<f32>::new(sr, new_sr, chunk_size, 1, channels, FixedSync::Both).unwrap();
+                let delay = resampler.output_delay();
+                let input_data = sample.outer_iter().map(|ch| ch.to_vec()).collect::<Vec<_>>();
+                let input = SequentialSliceOfVecs::new(&input_data, channels, len).unwrap();
+                let capacity = resampler.process_all_needed_output_len(len);
+                let mut ref_data = vec![vec![0f32; capacity]; channels];
+                let mut output =
+                    SequentialSliceOfVecs::new_mut(&mut ref_data, channels, capacity).unwrap();
+                let (_, ref_len) =
+                    resampler.process_all_into_buffer(&input, &mut output, len, None)?;
+                assert_eq!(out.len_of(Axis(1)), ref_len);
+                for (out_ch, ref_ch) in out.outer_iter().zip(ref_data.iter()) {
+                    let mismatches: Vec<usize> = out_ch
+                        .iter()
+                        .zip(ref_ch[..ref_len].iter())
+                        .enumerate()
+                        .filter(|(_, (a, b))| a.to_bits() != b.to_bits())
+                        .map(|(i, _)| i)
+                        .collect();
+                    assert!(
+                        mismatches.is_empty() || mismatches == [delay],
+                        "chunk {chunk_size} -> {new_sr}: unexpected mismatches at {:?} (delay {delay})",
+                        &mismatches[..mismatches.len().min(10)]
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Short inputs (less than one resampler chunk) must produce the same leading samples as
+    /// the same signal zero-padded to a multi-chunk length.
+    #[test]
+    fn test_resample_short_input_consistency() -> Result<()> {
+        let (sample, sr) = setup();
+        let short_len = 400;
+        let short = sample.slice_axis(Axis(1), Slice::from(..short_len)).to_owned();
+        let mut padded = Array2::zeros((short.len_of(Axis(0)), 4096));
+        padded.slice_axis_mut(Axis(1), Slice::from(..short_len)).assign(&short);
+        let new_sr = 16000;
+        let y_short = resample(short.view(), sr, new_sr, Some(512))?;
+        let y_pad = resample(padded.view(), sr, new_sr, Some(512))?;
+        let expected = (short_len as f64 * new_sr as f64 / sr as f64).ceil() as usize;
+        assert_eq!(y_short.len_of(Axis(1)), expected);
+        for (a, b) in y_short.iter().zip(y_pad.slice_axis(Axis(1), Slice::from(..expected)).iter())
+        {
+            assert!((a - b).abs() < 1e-6, "short/padded mismatch: {a} vs {b}");
+        }
+        Ok(())
+    }
+
+    /// An impulse in a short buffer must come back at the expected position with its energy
+    /// intact (no delay shift, no truncated tail).
+    #[test]
+    fn test_resample_impulse_delay_alignment() -> Result<()> {
+        setup();
+        let mut x = Array2::zeros((1, 480));
+        x[[0, 100]] = 1f32;
+        let y = resample(x.view(), 48000, 16000, Some(512))?;
+        let argmax = y
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .map(|(i, _)| i)
+            .unwrap();
+        assert!(
+            (argmax as i64 - 33).abs() <= 2,
+            "impulse moved to {argmax}, expected ~33"
+        );
+        assert!(
+            y[[0, argmax]].abs() > 0.1,
+            "impulse peak lost: {}",
+            y[[0, argmax]]
+        );
+        Ok(())
+    }
+
+    /// Resampling a real room impulse response (the augmentation path that triggered the bug)
+    /// must keep the direct-path peak at the ratio-scaled position.
+    #[test]
+    fn test_resample_rir_delay_alignment() -> Result<()> {
+        setup();
+        let reader =
+            ReadWav::new("../assets/rir_sim_1001_w11.7_l2.6_h2.5_rt60_0.7919.wav").unwrap();
+        let sr = reader.sr;
+        let rir = reader.samples_arr2().unwrap();
+        let argmax_orig = rir
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .map(|(i, _)| i)
+            .unwrap();
+        let y = resample(rir.view(), sr, sr / 3, Some(512))?;
+        let argmax_new = y
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+            .map(|(i, _)| i)
+            .unwrap();
+        assert!(
+            (argmax_new as i64 - (argmax_orig / 3) as i64).abs() <= 3,
+            "RIR peak moved: orig {argmax_orig} -> {argmax_new} (expected ~{})",
+            argmax_orig / 3
+        );
+        Ok(())
+    }
+
+    /// A down/up round trip must stay highly correlated with the original signal.
+    #[test]
+    fn test_resample_roundtrip_correlation() -> Result<()> {
+        let (sample, sr) = setup();
+        let down = resample(sample.view(), sr, sr * 2 / 3, None)?;
+        let up = resample(down.view(), sr * 2 / 3, sr, None)?;
+        let n = sample.len_of(Axis(1)).min(up.len_of(Axis(1)));
+        for (ich, och) in sample.outer_iter().zip(up.outer_iter()) {
+            let xx: f32 = ich.iter().take(n).map(|&s| s * s).sum();
+            let yy: f32 = och.iter().take(n).map(|&s| s * s).sum();
+            let xy: f32 = ich.iter().take(n).zip(och.iter().take(n)).map(|(&a, &b)| a * b).sum();
+            let corr = xy / (xx.sqrt() * yy.sqrt());
+            dbg!(corr);
+            assert!(corr > 0.95, "round-trip correlation too low: {corr}");
+        }
         Ok(())
     }
 }
