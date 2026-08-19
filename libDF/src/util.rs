@@ -12,6 +12,7 @@ use rand_xoshiro::rand_core::{Rng as XoshiroRng, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use thiserror::Error;
 
+#[cfg(feature = "logging")]
 pub use crate::logging::*;
 
 type Result<T> = std::result::Result<T, UtilsError>;

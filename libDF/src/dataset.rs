@@ -1718,17 +1718,6 @@ impl Hdf5Dataset {
             n => return Err(DfDatasetError::PcmUnspportedDimension(n)),
         })
     }
-    fn convert_hdf5_array(arr: ndarray_015::ArrayD<f32>) -> Result<ArrayD<f32>> {
-        let shape = arr.shape().to_vec();
-        // hdf5 builds its arrays from a freshly read contiguous buffer, so the raw vec can be
-        // moved into the ndarray 0.17 array without copying.
-        let data = if arr.is_standard_layout() {
-            arr.into_raw_vec()
-        } else {
-            arr.iter().copied().collect()
-        };
-        Ok(ArrayD::from_shape_vec(IxDyn(&shape), data)?)
-    }
     /// Read a PCM encoded sample from an `hdf5::Dataset`.
     ///
     /// Arguments:
@@ -1777,9 +1766,8 @@ impl Hdf5Dataset {
             n => return Err(DfDatasetError::PcmUnspportedDimension(n)),
         };
 
-        // Select on disk before copying from HDF5's ndarray 0.15 into ndarray 0.17.
-        let arr = ds.read_slice::<f32, _, ndarray_015::IxDyn>(selection)?;
-        let mut arr = self.match_ch(Self::convert_hdf5_array(arr)?, 0, None)?;
+        let arr = ds.read_slice::<f32, _, IxDyn>(selection)?;
+        let mut arr = self.match_ch(arr, 0, None)?;
         match self.dtype {
             Some(DType::I16) => arr /= i16::MAX as f32,
             Some(DType::F32) => (),

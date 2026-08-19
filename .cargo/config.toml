@@ -1,0 +1,5 @@
+[env]
+# Debian names the serial HDF5 library libhdf5_serial.so, which hdf5-metno-sys'
+# runtime probe doesn't recognize; point it at the serial layout instead.
+# ponytail: Debian-only path; override HDF5_DIR in your shell on other distros/OSes.
+HDF5_DIR = { value = "/usr/lib/x86_64-linux-gnu/hdf5/serial", force = false }
